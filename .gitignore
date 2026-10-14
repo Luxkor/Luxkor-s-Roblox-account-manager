@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Compilación
+build/
+dist/
+*.spec
+
+# Datos del usuario: NUNCA subir (contienen cookies cifradas)
+data.json
+data.json.*
+*.corrupto-*
+app.log*
+rm-login-*/
+
+# Editores / sistema
+.idea/
+.vscode/
+Thumbs.db
