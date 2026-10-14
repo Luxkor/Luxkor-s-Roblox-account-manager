@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover
 
 APP_NAME = "RobloxManager"
 APP_TITLE = "Luxkor's Account Manager"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 IS_WINDOWS = os.name == "nt"
 PLAYER_EXE = "RobloxPlayerBeta.exe"
 MUTEX_NAME = "ROBLOX_singletonMutex"
