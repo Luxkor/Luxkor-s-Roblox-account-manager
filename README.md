@@ -50,7 +50,7 @@ Doble clic en `build_exe.bat`, o a mano:
 
 ```powershell
 pip install -r requirements.txt -r requirements-dev.txt
-pyinstaller --onefile --noconsole --clean --icon assets/icon.ico --name LuxkorAccountManager roblox_manager.py
+pyinstaller --onefile --noconsole --clean --add-data "assets/star.png;assets" --icon assets/icon.ico --name LuxkorAccountManager roblox_manager.py
 ```
 
 El resultado queda en `dist/LuxkorAccountManager.exe`. Los datos del usuario se guardan en `%APPDATA%\RobloxManager`, no junto al `.exe`.

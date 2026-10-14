@@ -25,6 +25,7 @@ import io
 import json
 import logging
 import logging.handlers
+import math
 import os
 import queue
 import random
@@ -49,9 +50,9 @@ try:
 except ImportError:  # pragma: no cover
     tk = None
 try:
-    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageGrab, ImageTk
 except ImportError:  # pragma: no cover
-    Image = None
+    Image = ImageGrab = None
 
 APP_NAME = "RobloxManager"
 APP_TITLE = "Luxkor's Account Manager"
@@ -374,14 +375,17 @@ class Store:
         with self.lock:
             return [dict(p) for p in self.data["places"]]
 
-    def add_place(self, name: str, place_id: int):
+    def add_place(self, name: str, place_id: int, universe_id=None, icon=None):
         with self.lock:
-            for p in self.data["places"]:
-                if p["place_id"] == place_id:
-                    p["name"] = name
-                    break
-            else:
-                self.data["places"].append({"name": name, "place_id": place_id})
+            entry = next((p for p in self.data["places"] if p["place_id"] == place_id), None)
+            if entry is None:
+                entry = {"name": name, "place_id": place_id}
+                self.data["places"].append(entry)
+            entry["name"] = name
+            if universe_id:
+                entry["universe_id"] = universe_id
+            if icon:
+                entry["icon"] = icon
             self._save()
 
     def delete_place(self, place_id: int):
@@ -794,6 +798,20 @@ class RobloxAPI:
             url, uid = item.get("imageUrl"), _posint(item.get("targetId"))
             if uid and isinstance(url, str) and self.img_ok(url):
                 out[uid] = url
+        return out
+
+    def place_icons(self, place_ids):
+        ids = [int(i) for i in place_ids][:100]
+        if not ids:
+            return {}
+        q = urllib.parse.urlencode({"placeIds": ",".join(str(i) for i in ids), "returnPolicy": "PlaceHolder",
+                                    "size": "150x150", "format": "Png", "isCircular": "false"})
+        data = self._get_json(self.thumbs_base + "/v1/places/gameicons?" + q)
+        out = {}
+        for item in (data.get("data", []) if isinstance(data, dict) else []):
+            url, pid = item.get("imageUrl"), _posint(item.get("targetId"))
+            if pid and isinstance(url, str) and self.img_ok(url):
+                out[pid] = url
         return out
 
     # -- inicio rápido (Quick Log In): se escribe un código en un dispositivo donde ya hay sesión
@@ -1347,12 +1365,13 @@ class Manager:
                 self.multi_active, self.multi_detail = False, ""
             return {"active": self.multi_active, "detail": self.multi_detail}
 
-    def add_place(self, name: str, place_text: str):
+    def add_place(self, name: str, place_text: str, game=None):
         place = parse_place(place_text)
         if place is None:
             raise ValueError("Escribe primero el ID o el enlace del juego.")
         name = name.strip()[:40] or ("Juego %d" % place)
-        self.store.add_place(name, place)
+        game = game or {}
+        self.store.add_place(name, place, game.get("universe_id"), game.get("icon"))
 
     # -- lanzar y cerrar
     def launch(self, ids, place_text, job_text, delay):
@@ -1411,7 +1430,7 @@ class Manager:
             self.set_status(aid, "Abriendo Roblox…", "busy")
             self.plat.launch(build_launch_uri(ticket, place, job))
             self.store.update_account(aid, last_launch=int(time.time()))
-            pid = self._wait_new_pid(before, 60)
+            pid = self._wait_new_pid(before, 15)
             with self.lock:
                 if pid:
                     self.pids[aid] = pid
@@ -1430,9 +1449,8 @@ class Manager:
             new = [p for p in self.plat.list_pids() if p not in before]
             if new:
                 return max(new)
-            time.sleep(1)
+            time.sleep(0.5)
         return None
-
     def close(self, ids, everything=False):
         if everything:
             self.plat.kill_all()
@@ -1501,6 +1519,12 @@ FONTS = {}
 SCALE = 1.0
 IMG_OK = roblox_img_ok  # las pruebas pueden cambiarlo
 _PHOTOS = {}
+
+
+def asset_path(name: str) -> str:
+    """Ruta de un recurso tanto desde el código como desde el ejecutable PyInstaller."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "assets", name)
 
 
 def px(n) -> int:
@@ -1924,8 +1948,6 @@ class AccountRow(tk.Canvas):
         self.b_go = Btn(self, "Abierta" if running else "Lanzar", lambda: app.do_launch([a["id"]]), "primary",
                         padx=14, pady=6, font="s", min_w=78, bg=self.bgc)
         self.b_go.set_enabled(not busy and not running)
-        self.b_close = Btn(self, "Cerrar", lambda: app.close_ids([a["id"]]), "ghost", padx=12, pady=6, font="s", bg=self.bgc)
-        self.b_close.set_enabled(running)
         self.b_edit = Btn(self, "✎", lambda: app.rename(a["id"], a["alias"]), "ghost", padx=10, pady=6, font="s", bg=self.bgc)
         self._job, self._width, self._keep = None, 0, []
         self.bind("<Configure>", self._on_size)
@@ -1961,7 +1983,7 @@ class AccountRow(tk.Canvas):
         tx = x + size + 2 * ring_pad(size) + px(14)
         # botones a la derecha
         ex = w - pad
-        for b in (self.b_edit, self.b_close, self.b_go):
+        for b in (self.b_edit, self.b_go):
             self.create_window(ex, h // 2, window=b, anchor="e")
             ex -= b.w + px(6)
         room = ex - tx
@@ -1999,6 +2021,9 @@ class GameCard(tk.Canvas):
         size = w - 2 * pad
         icon = self.create_image(pad, pad, anchor="nw")
         app.set_image(g.get("icon"), "game", size, g["name"], lambda ph: self._apply(icon, ph))
+        is_favorite = any(p["place_id"] == g["place_id"] for p in app.m.store.places())
+        self._star_item = self.create_image(w - pad, pad, image=app.star_image(px(24), is_favorite), anchor="ne")
+        self.tag_bind(self._star_item, "<Button-1>", self._toggle_favorite)
         lines = fit_lines(g["name"], FONTS["sb"], w - 2 * px(12), 2)
         self.create_text(px(12), pad + size + px(10), anchor="nw", text="\n".join(lines), fill=C["ink"], font=FONTS["sb"])
         players = "%s jugando" % format(g["players"], ",").replace(",", ".") if g.get("players") is not None else ""
@@ -2009,6 +2034,13 @@ class GameCard(tk.Canvas):
         self.bind("<Button-1>", lambda e: app.pick_game(g))
         if fav:
             self.bind("<Button-3>", lambda e: app.remove_fav(g))
+
+    def _toggle_favorite(self, _event=None):
+        self.app.root.after_idle(self.app.toggle_game_fav, self.g)
+        return "break"
+
+    def set_favorite(self, enabled):
+        self.itemconfigure(self._star_item, image=self.app.star_image(px(24), enabled))
 
     def _apply(self, item, ph):
         self._ph = ph
@@ -2219,8 +2251,8 @@ class App:
             SCALE = 1.0
         root.title(APP_TITLE)
         root.configure(bg=C["bg"])
-        root.geometry("%dx%d" % (px(1220), px(800)))
-        root.minsize(px(1040), px(660))
+        root.geometry("%dx%d" % (px(1220), px(860)))
+        root.minsize(px(1000), px(740))
         for key, size, weight in (("n", 10, "normal"), ("b", 10, "bold"), ("s", 9, "normal"), ("sb", 9, "bold"),
                                   ("h", 17, "bold"), ("t", 13, "bold")):
             FONTS[key] = tkfont.Font(root=root, family="Segoe UI", size=size, weight=weight)
@@ -2229,10 +2261,14 @@ class App:
         self.q = queue.Queue()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=6)
         self.photos, self.sel, self.anchor = {}, set(), None
+        self.star_photos = {}
+        root.report_callback_exception = self._report_callback_exception
         self.state, self.acc_sig, self.places_sig = None, None, None
         self.greq, self.sorts, self.cat_id, self.sorts_error = 0, [], None, ""
         self.game_cards, self.sel_game, self.add_dialog = [], None, None
+        self._fav_icon_loading = False
         self.toast_job = self.save_job = self.search_job = self.layout_job = None
+        self.fav_confirm = None
         self._build_style()
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -2243,6 +2279,33 @@ class App:
         self._pump()
         self.tick()
         self.bg(self.m.game_sorts, self._sorts_done)
+
+    def _report_callback_exception(self, exc, value, tb):
+        log.error("Excepción en evento de interfaz", exc_info=(exc, value, tb))
+
+    def star_image(self, size, filled=False):
+        key = (size, bool(filled))
+        cached = self.star_photos.get(key)
+        if cached is not None:
+            return cached
+        high = max(4, size * 4)
+        if filled:
+            im = Image.new("RGBA", (high, high), (0, 0, 0, 0))
+            cx = cy = high / 2
+            points = []
+            for i in range(10):
+                angle = -math.pi / 2 + i * math.pi / 5
+                radius = high * (0.47 if i % 2 == 0 else 0.205)
+                points.append((cx + math.cos(angle) * radius, cy + math.sin(angle) * radius))
+            draw = ImageDraw.Draw(im)
+            draw.polygon(points, fill="#ffcc33")
+            draw.line(points + [points[0]], fill="#ffdf70", width=max(3, high // 28), joint="curve")
+        else:
+            im = Image.open(asset_path("star.png")).convert("RGBA").resize((high, high), Image.LANCZOS)
+        im = im.resize((size, size), Image.LANCZOS)
+        cached = ImageTk.PhotoImage(im)
+        self.star_photos[key] = cached
+        return cached
 
     # -- estilo
     def _build_style(self):
@@ -2354,9 +2417,21 @@ class App:
             pass
         self.root.after(40, self._pump)
 
+    def _hide_toast(self):
+        self.toast_job = None
+        try:
+            self.toast_cv.place_forget()
+            self.toast_cv.delete("all")
+        except tk.TclError:
+            pass
+
     def toast(self, text, bad=False):
         if self.toast_job:
-            self.root.after_cancel(self.toast_job)
+            try:
+                self.root.after_cancel(self.toast_job)
+            except tk.TclError:
+                pass
+            self.toast_job = None
         cv = self.toast_cv
         cv.delete("all")
         t = cv.create_text(px(20), px(14), anchor="nw", text=text, fill="#ffffff" if bad else C["ink"],
@@ -2369,9 +2444,9 @@ class App:
         cv.create_image(0, 0, image=self._toast_img, anchor="nw")
         cv.tag_raise(t)
         cv.place(relx=0.5, rely=1.0, y=-px(168), anchor="s")
-        cv.lift()
-        self.toast_job = self.root.after(8000 if bad else 4500, cv.place_forget)
-
+        self.toast_job = self.root.after(8000 if bad else 3000, self._hide_toast)
+        # Canvas.tkraise() eleva elementos del dibujo; esta orden Tcl eleva el widget.
+        cv.tk.call("raise", cv._w)
     def _wheel(self, e):
         w = self.root.winfo_containing(e.x_root, e.y_root)
         while w is not None:
@@ -2428,7 +2503,7 @@ class App:
         titles.pack(side="left", padx=(px(14), 0))
         lbl(titles, APP_TITLE, "ink", "h").pack(anchor="w")
         lbl(titles, "Cuentas de Roblox · multi-instancia", "muted", "s").pack(anchor="w")
-        Btn(head, "Cerrar todos los Roblox", self.close_all, "danger", padx=14, pady=8).pack(side="right")
+        Btn(head, "Cerrar todas las instancias", self.close_all, "danger", padx=14, pady=8).pack(side="right")
         self.count_lbl = lbl(head, "", "muted")
         self.count_lbl.pack(side="right", padx=px(18))
         self.multi_btn = Btn(head, "Multi-instancia", self.toggle_multi, "pill", padx=14, pady=8, radius=17,
@@ -2487,11 +2562,11 @@ class App:
         self.games_sf.canvas.bind("<Configure>", self._games_resized, add="+")
 
         # pie: juego + opciones + acciones
-        foot = Panel(root, height=px(132))
-        foot.grid(row=3, column=0, sticky="ew", padx=pad, pady=(px(14), px(22)))
+        foot = Panel(root)
+        foot.grid(row=3, column=0, sticky="ew", padx=pad, pady=(px(12), px(16)))
         fb = foot.body
         r1 = tk.Frame(fb, bg=C["panel"])
-        r1.pack(fill="x", padx=px(18), pady=(px(16), px(8)))
+        r1.pack(fill="x", padx=px(18), pady=(px(12), px(6)))
         self.place_var, self.job_var = tk.StringVar(), tk.StringVar()
         self.delay_var = tk.StringVar(value="5")
         Field(r1, self.place_var, "ID o enlace del juego", width=330).pack(side="left")
@@ -2509,7 +2584,7 @@ class App:
             v.trace_add("write", self._settings_changed)
 
         r2 = tk.Frame(fb, bg=C["panel"])
-        r2.pack(fill="x", padx=px(18), pady=(px(4), px(14)))
+        r2.pack(fill="x", padx=px(18), pady=(px(4), px(12)))
         self.pick_lbl = lbl(r2, "", "muted")
         self.pick_lbl.pack(side="left")
         self.btn_go = Btn(r2, "Lanzar", self.go, "primary", padx=30, pady=11, font="b", min_w=170, radius=13)
@@ -2543,7 +2618,8 @@ class App:
         on = multi["active"]
         self.multi_btn.set_text("Multi-instancia %s" % ("activa" if on else "inactiva"))
         self.multi_btn.set_dot(C["ok"] if on else C["bad"])
-        self.count_lbl.configure(text="%d Roblox abierto%s" % (st["roblox_count"], "" if st["roblox_count"] == 1 else "s"))
+        n_open = st["roblox_count"]
+        self.count_lbl.configure(text="%d instancia%s abierta%s" % (n_open, "" if n_open == 1 else "s", "" if n_open == 1 else "s"))
         want = st["settings"].get("multi", True)
         if want and not on and multi["detail"]:
             self.notice_lbl.configure(text=multi["detail"])
@@ -2562,6 +2638,13 @@ class App:
             self.places_sig = psig
             if self.cat_id == "fav":
                 self.show_favs()
+            else:
+                self.update_favorite_stars()
+
+    def update_favorite_stars(self):
+        favorite_ids = {p["place_id"] for p in self.m.store.places()}
+        for card in self.game_cards:
+            card.set_favorite(card.g["place_id"] in favorite_ids)
 
     # -- cuentas
     def render_accounts(self):
@@ -2719,7 +2802,7 @@ class App:
         self.close_ids(list(self.sel))
 
     def close_all(self):
-        if self.ask("Cerrar todos los Roblox", "¿Cerrar todos los Roblox abiertos, incluidos los que no se lanzaron "
+        if self.ask("Cerrar todas las instancias", "¿Cerrar todas las instancias de Roblox abiertas, incluidas las que no se lanzaron "
                     "desde aquí?", [("Cancelar", None, "ghost"), ("Cerrar todos", "yes", "danger")]):
             self.bg(lambda: self.m.close([], True), lambda r, e: self.refresh())
 
@@ -2769,7 +2852,7 @@ class App:
     def on_search_typed(self):
         if self.search_job:
             self.root.after_cancel(self.search_job)
-        self.search_job = self.root.after(450, self.run_search)
+        self.search_job = self.root.after(300, self.run_search)
 
     def run_search(self):
         q = self.search_var.get().strip()
@@ -2801,13 +2884,31 @@ class App:
 
     def show_favs(self):
         self.greq += 1
-        games = [{"universe_id": None, "place_id": p["place_id"], "name": p["name"], "players": None, "icon": None}
-                 for p in self.m.store.places()]
+        places = self.m.store.places()
+        games = [{"universe_id": p.get("universe_id"), "place_id": p["place_id"], "name": p["name"],
+                  "players": None, "icon": p.get("icon")} for p in places]
         self.render_games(games, fav=True)
+        missing = [p for p in places if not p.get("icon")]
+        if missing and not self._fav_icon_loading:
+            self._fav_icon_loading = True
+            self.bg(lambda: self.m.api.place_icons([p["place_id"] for p in missing]),
+                    lambda r, e: self._favorite_icons_done(missing, r, e))
         msg = "" if games else "Aún no tienes favoritos. Elige un juego y pulsa «★ Favorito»."
         if self.sorts_error and not self.sorts:
             msg = self.sorts_error + " Reintentando… mientras tanto puedes buscar un juego."
         self.set_gmsg(msg, bool(self.sorts_error and not self.sorts))
+
+    def _favorite_icons_done(self, places, icons, err):
+        self._fav_icon_loading = False
+        if err or not icons:
+            return
+        current_ids = {place["place_id"] for place in self.m.store.places()}
+        for place in places:
+            icon = icons.get(place["place_id"])
+            if icon and place["place_id"] in current_ids:
+                self.m.store.add_place(place["name"], place["place_id"], place.get("universe_id"), icon)
+        if self.cat_id == "fav":
+            self.show_favs()
 
     def clear_cards(self):
         for card in self.game_cards:
@@ -2858,18 +2959,66 @@ class App:
         if name is None:
             return
         try:
-            self.m.add_place(name, str(place))
+            game = self.sel_game if self.sel_game and self.sel_game.get("place_id") == place else None
+            self.m.add_place(name, str(place), game)
             self.toast("Guardado en favoritos.")
         except ValueError as err:
             self.toast(str(err), True)
         self.refresh()
 
-    def remove_fav(self, g):
-        if self.ask("Quitar favorito", "¿Quitar «%s» de favoritos?" % g["name"],
-                    [("Cancelar", None, "ghost"), ("Quitar", "yes", "danger")]):
-            self.m.store.delete_place(g["place_id"])
+    def toggle_game_fav(self, g):
+        if any(p["place_id"] == g["place_id"] for p in self.m.store.places()):
+            self.remove_fav(g)
+            return
+        try:
+            self.m.add_place(g["name"], str(g["place_id"]), g)
+            self.toast("Guardado en favoritos.")
             self.refresh()
+        except ValueError as err:
+            self.toast(str(err), True)
 
+    def remove_fav(self, g):
+        if self.fav_confirm is not None:
+            try:
+                self.fav_confirm.destroy()
+            except tk.TclError:
+                pass
+        self.root.update_idletasks()
+        width, height = max(1, self.root.winfo_width()), max(1, self.root.winfo_height())
+        try:
+            x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+            backdrop = ImageGrab.grab(bbox=(x, y, x + width, y + height)).convert("RGB")
+            backdrop = backdrop.resize((width, height), Image.Resampling.LANCZOS)
+            tint = Image.new("RGB", (width, height), C["bg"])
+            backdrop = Image.blend(backdrop, tint, 0.38)
+            backdrop = backdrop.filter(ImageFilter.GaussianBlur(radius=max(1, px(1))))
+            self._fav_backdrop = ImageTk.PhotoImage(backdrop)
+            shade = tk.Label(self.root, image=self._fav_backdrop, bg=C["bg"], bd=0, highlightthickness=0)
+        except Exception:  # noqa: BLE001
+            log.exception("No se pudo capturar el fondo para confirmar la eliminación del favorito")
+            self._fav_backdrop = None
+            shade = tk.Frame(self.root, bg=C["card2"])
+        shade.place(x=0, y=0, relwidth=1, relheight=1)
+        panel = Panel(shade, fill=C["panel"], border=C["line2"], radius=16)
+        panel.place(relx=0.5, rely=0.5, anchor="center", width=px(440), height=px(190))
+        body = panel.body
+        lbl(body, "Quitar favorito", "ink", "h").pack(anchor="w", padx=px(24), pady=(px(20), px(8)))
+        lbl(body, "¿Quitar «%s» de favoritos?" % g["name"], "muted", wraplength=px(380),
+            justify="left").pack(anchor="w", padx=px(24))
+        buttons = tk.Frame(body, bg=C["panel"])
+        buttons.pack(side="bottom", fill="x", padx=px(20), pady=px(16))
+        def close():
+            self.fav_confirm = None
+            shade.destroy()
+        def remove():
+            self.m.store.delete_place(g["place_id"])
+            close()
+            self.refresh()
+        Btn(buttons, "Quitar", remove, "danger").pack(side="right", padx=(px(8), 0))
+        Btn(buttons, "Cancelar", close, "ghost").pack(side="right")
+        self.fav_confirm = shade
+        shade.bind("<Escape>", lambda _e: close())
+        shade.focus_set()
     # -- salir
     def on_close(self):
         if self.m.launching() and not self.ask("Salir", "Hay un lanzamiento en curso. ¿Salir igualmente?",
@@ -2963,12 +3112,12 @@ def main(argv=None) -> int:
 
     directory = data_dir()
     setup_logging(directory)
-    sweep_login_profiles()
     prepare_windows()
     if not single_instance():
         return 0
     manager = Manager(Store(os.path.join(directory, "data.json")), RobloxAPI(), make_platform())
     manager.start()
+    threading.Thread(target=sweep_login_profiles, daemon=True).start()
     try:
         App(manager).run()
     except Exception:  # noqa: BLE001

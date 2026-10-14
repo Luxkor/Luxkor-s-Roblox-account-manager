@@ -20,7 +20,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo Creando el .exe...
-%PY% -m PyInstaller --onefile --noconsole --clean --icon assets\icon.ico --name LuxkorAccountManager roblox_manager.py
+%PY% -m PyInstaller --onefile --noconsole --clean --add-data "assets\star.png;assets" --icon assets\icon.ico --name LuxkorAccountManager roblox_manager.py
 if errorlevel 1 (
   echo Fallo al crear el .exe.
   pause
