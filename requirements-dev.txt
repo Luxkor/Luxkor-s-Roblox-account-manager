@@ -1,4 +1,4 @@
 -r requirements.txt
 pyinstaller==6.22.3
-websockets>=12
+websockets>=17.2
 pyflakes>=3
