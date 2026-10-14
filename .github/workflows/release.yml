@@ -32,7 +32,7 @@ jobs:
           $h = (Get-FileHash dist/LuxkorAccountManager.exe -Algorithm SHA256).Hash.ToLower()
           "$h  LuxkorAccountManager.exe" | Out-File -Encoding ascii dist/LuxkorAccountManager.exe.sha256
       - name: Procedencia verificable
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/LuxkorAccountManager.exe
       - name: Publicar release
