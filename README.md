@@ -20,16 +20,14 @@ a la vez en varias instancias del cliente. Aplicación de escritorio (Tkinter), 
 
 ## Descargar
 
-Ve a [**Releases**](../../releases) y descarga `LuxkorAccountManager.exe`. No necesita instalación ni Python.
+Descarga `LuxkorAccountManager.exe` y `LuxkorAccountManager.exe.sha256` desde [**Releases**](../../releases). El ejecutable es autónomo: no necesita instalación ni Python.
 
 Cada versión se compila automáticamente en GitHub Actions. Para comprobar que el archivo es el oficial:
 
 ```powershell
-# 1) La huella SHA-256 debe coincidir con LuxkorAccountManager.exe.sha256
-(Get-FileHash .\LuxkorAccountManager.exe -Algorithm SHA256).Hash
-
-# 2) Verificar la procedencia (requiere GitHub CLI)
-gh attestation verify .\LuxkorAccountManager.exe --repo TU_USUARIO/luxkor-account-manager
+$expected = (Get-Content .\LuxkorAccountManager.exe.sha256).Split()[0]
+$actual = (Get-FileHash .\LuxkorAccountManager.exe -Algorithm SHA256).Hash
+if ($actual -ne $expected) { throw "El SHA-256 no coincide" }
 ```
 
 Windows SmartScreen puede avisar porque el programa no está firmado digitalmente: «Más información» → «Ejecutar de todas formas».
@@ -46,11 +44,11 @@ python roblox_manager.py
 
 ## Compilar el `.exe`
 
-Doble clic en `build_exe.bat`, o a mano:
+Instala las dependencias de compilación y ejecuta:
 
 ```powershell
 pip install -r requirements.txt -r requirements-dev.txt
-pyinstaller --onefile --noconsole --clean --add-data "assets/star.png;assets" --icon assets/icon.ico --name LuxkorAccountManager roblox_manager.py
+pyinstaller --onefile --noconsole --clean --exclude-module numpy --add-data "assets/star.png;assets" --icon assets/icon.ico --name LuxkorAccountManager roblox_manager.py
 ```
 
 El resultado queda en `dist/LuxkorAccountManager.exe`. Los datos del usuario se guardan en `%APPDATA%\RobloxManager`, no junto al `.exe`.

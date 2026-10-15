@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover
 
 APP_NAME = "RobloxManager"
 APP_TITLE = "Luxkor's Account Manager"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 IS_WINDOWS = os.name == "nt"
 PLAYER_EXE = "RobloxPlayerBeta.exe"
 MUTEX_NAME = "ROBLOX_singletonMutex"
@@ -1602,7 +1602,7 @@ def _rgba(h, a=255):
 
 def rr_image(w, h, r, fill=None, border=None, bw=1, grad=None, dot=None, dot_x=0, extra=None):
     """Rectángulo redondeado antialias: relleno liso o degradado, borde opcional, punto de color opcional."""
-    S = 4
+    S = 2
     w, h = max(1, int(w)), max(1, int(h))
     W, H = w * S, h * S
     R = int(r * S)
@@ -1782,6 +1782,23 @@ class Btn(tk.Canvas):
             self._draw()
 
 
+def _rounded_canvas_items(canvas, tag, fill):
+    items = [canvas.create_rectangle(0, 0, 1, 1, fill=fill, outline="", tags=(tag,)) for _ in range(2)]
+    items.extend(canvas.create_oval(0, 0, 1, 1, fill=fill, outline="", tags=(tag,)) for _ in range(4))
+    return items
+
+
+def _draw_rounded_canvas_layer(canvas, items, x, y, w, h, radius, fill):
+    r = min(radius, max(1, h // 2), max(1, w // 2))
+    boxes = ((x + r, y, x + w - r, y + h), (x, y + r, x + w, y + h - r),
+             (x, y, x + 2 * r, y + 2 * r), (x + w - 2 * r, y, x + w, y + 2 * r),
+             (x, y + h - 2 * r, x + 2 * r, y + h),
+             (x + w - 2 * r, y + h - 2 * r, x + w, y + h))
+    for item, box in zip(items, boxes):
+        canvas.coords(item, *box)
+        canvas.itemconfigure(item, fill=fill, outline="")
+
+
 class Panel(tk.Frame):
     """Contenedor con esquinas redondeadas. Los hijos se colocan en .body"""
 
@@ -1792,27 +1809,28 @@ class Panel(tk.Frame):
         self.fill, self.border, self.radius = fill or C["panel"], border or C["line"], px(radius)
         self.cv = tk.Canvas(self, bg=self.cget("bg"), highlightthickness=0, bd=0)
         self.cv.place(x=0, y=0, relwidth=1, relheight=1)
+        self._outer = _rounded_canvas_items(self.cv, "outer", self.border)
+        self._inner = _rounded_canvas_items(self.cv, "inner", self.fill)
         inset = int(self.radius * 0.3) + px(2)
         self.body = tk.Frame(self, bg=self.fill)
         self.body.place(x=inset, y=inset, relwidth=1, relheight=1, width=-2 * inset, height=-2 * inset)
-        self._img, self._job, self._size = None, None, (0, 0)
+        self._job, self._size = None, (0, 0)
         self.cv.bind("<Configure>", self._resized)
 
     def _resized(self, e):
         if (e.width, e.height) == self._size:
             return
         self._size = (e.width, e.height)
-        if self._job:
-            self.after_cancel(self._job)
-        self._job = self.after(20, self._redraw)
+        self._redraw()
 
     def _redraw(self):
         w, h = self._size
         if w < 4 or h < 4:
             return
-        self._img = ImageTk.PhotoImage(rr_image(w, h, self.radius, self.fill, self.border))
-        self.cv.delete("all")
-        self.cv.create_image(0, 0, image=self._img, anchor="nw")
+        _draw_rounded_canvas_layer(self.cv, self._outer, 0, 0, w, h, self.radius, self.border)
+        inset = max(1, px(1))
+        _draw_rounded_canvas_layer(self.cv, self._inner, inset, inset, w - 2 * inset, h - 2 * inset,
+                                   max(1, self.radius - inset), self.fill)
 
 
 class ScrollFrame(tk.Frame):
@@ -1861,7 +1879,9 @@ class Field(tk.Frame):
         self.var = textvariable or tk.StringVar()
         self.cv = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
         self.cv.place(x=0, y=0, relwidth=1, relheight=1)
-        self.focused, self._img, self._size = False, None, (0, 0)
+        self.focused, self._size = False, (0, 0)
+        self._outer = _rounded_canvas_items(self.cv, "outer", "#2e2e3a")
+        self._inner = _rounded_canvas_items(self.cv, "inner", C["card"])
         self.entry = tk.Entry(self, textvariable=self.var, bd=0, relief="flat", highlightthickness=0, bg=C["card"],
                               fg=C["ink"], insertbackground=C["ink"], selectbackground=C["accent"],
                               selectforeground="#ffffff", font=FONTS["n"], justify=justify)
@@ -1893,9 +1913,11 @@ class Field(tk.Frame):
         w, h = self._size
         if w < 4 or h < 4:
             return
-        self._img = ImageTk.PhotoImage(rr_image(w, h, px(11), C["card"], C["accent"] if self.focused else "#2e2e3a"))
-        self.cv.delete("all")
-        self.cv.create_image(0, 0, image=self._img, anchor="nw")
+        border = C["accent"] if self.focused else "#2e2e3a"
+        _draw_rounded_canvas_layer(self.cv, self._outer, 0, 0, w, h, px(11), border)
+        inset = max(1, px(1))
+        _draw_rounded_canvas_layer(self.cv, self._inner, inset, inset, w - 2 * inset, h - 2 * inset,
+                                   max(1, px(11) - inset), C["card"])
 
 
 class ChipBar(tk.Frame):
@@ -1949,7 +1971,10 @@ class AccountRow(tk.Canvas):
                         padx=14, pady=6, font="s", min_w=78, bg=self.bgc)
         self.b_go.set_enabled(not busy and not running)
         self.b_edit = Btn(self, "✎", lambda: app.rename(a["id"], a["alias"]), "ghost", padx=10, pady=6, font="s", bg=self.bgc)
+        self._bg_outer = self._make_round_layer("background", C["line"])
+        self._bg_inner = self._make_round_layer("background", self.bgc)
         self._job, self._width, self._keep = None, 0, []
+        self._rendered = False
         self.bind("<Configure>", self._on_size)
         self.bind("<Button-1>", lambda e: app.toggle(a["id"], idx, bool(e.state & 0x1)))
         self.bind("<Double-Button-1>", lambda e: app.do_launch([a["id"]]))
@@ -1958,48 +1983,90 @@ class AccountRow(tk.Canvas):
         if e.width == self._width:
             return
         self._width = e.width
-        if self._job:
-            self.after_cancel(self._job)
-        self._job = self.after(15, self.render)
+        if self._rendered:
+            self._resize_content()
+        else:
+            if self._job:
+                self.after_cancel(self._job)
+            self._job = self.after(16, self.render)
+
+    def _make_round_layer(self, tag, fill):
+        items = [self.create_rectangle(0, 0, 1, 1, fill=fill, outline="", tags=(tag,)) for _ in range(2)]
+        items.extend(self.create_oval(0, 0, 1, 1, fill=fill, outline="", tags=(tag,)) for _ in range(4))
+        return items
+
+    def _draw_round_layer(self, items, x, y, w, h, radius, fill):
+        r = min(radius, max(1, h // 2), max(1, w // 2))
+        coords = ((x + r, y, x + w - r, y + h), (x, y + r, x + w, y + h - r),
+                  (x, y, x + 2 * r, y + 2 * r), (x + w - 2 * r, y, x + w, y + 2 * r),
+                  (x, y + h - 2 * r, x + 2 * r, y + h),
+                  (x + w - 2 * r, y + h - 2 * r, x + w, y + h))
+        for item, box in zip(items, coords):
+            self.coords(item, *box)
+            self.itemconfigure(item, fill=fill, outline="")
 
     def render(self):
         w, h, a = self._width, px(self.H), self.a
         if w < 120:
             return
-        self.delete("all")
+        self._job = None
+        self.delete("content")
         self._keep = []
         pad = px(16)
         border = C["accent"] if self.sel else C["line"]
-        bg = ImageTk.PhotoImage(rr_image(w, h, px(16), self.bgc, border))
-        self._keep.append(bg)
-        self.create_image(0, 0, image=bg, anchor="nw")
+        self._draw_round_layer(self._bg_outer, 0, 0, w, h, px(16), border)
+        inset = px(1)
+        self._draw_round_layer(self._bg_inner, inset, inset, w - 2 * inset, h - 2 * inset,
+                               max(1, px(16) - inset), self.bgc)
         n = px(22)
-        self.create_image(pad, h // 2, image=photo(("chk", self.sel, n), lambda: check_image(self.sel, n)), anchor="w")
+        self._check_item = self.create_image(pad, h // 2,
+                                             image=photo(("chk", self.sel, n), lambda: check_image(self.sel, n)),
+                                             anchor="w", tags=("content",))
         size = px(44)
         x = pad + n + px(14)
-        item = self.create_image(x, h // 2, anchor="w")
+        self._avatar_item = self.create_image(x, h // 2, anchor="w", tags=("content",))
         self.app.set_image(a.get("avatar"), "avatar", size, a["alias"] or a["username"],
-                           lambda ph, it=item: self._apply(it, ph), RING.get(a["tag"], RING["idle"]))
-        tx = x + size + 2 * ring_pad(size) + px(14)
-        # botones a la derecha
+                           lambda ph, it=self._avatar_item: self._apply(it, ph), RING.get(a["tag"], RING["idle"]))
+        self._button_items = [self.create_window(0, h // 2, window=b, anchor="e", tags=("content",))
+                              for b in (self.b_edit, self.b_go)]
+        self._alias_item = self.create_text(0, h * 0.36, anchor="w", fill=C["ink"], font=FONTS["b"],
+                                            tags=("content",))
+        self._user_item = self.create_text(0, h * 0.68, anchor="w", fill=C["muted"], font=FONTS["s"],
+                                           tags=("content",))
+        self._badge_items = self._make_round_layer("content", C["line"])
+        self._status_item = self.create_text(0, h * 0.68, anchor="center", font=FONTS["sb"], tags=("content",))
+        self._rendered = True
+        self._resize_content()
+
+    def _resize_content(self):
+        w, h, a = self._width, px(self.H), self.a
+        if w < 120:
+            return
+        self._draw_round_layer(self._bg_outer, 0, 0, w, h, px(16), C["accent"] if self.sel else C["line"])
+        inset = px(1)
+        self._draw_round_layer(self._bg_inner, inset, inset, w - 2 * inset, h - 2 * inset,
+                               max(1, px(16) - inset), self.bgc)
+        pad, n, size = px(16), px(22), px(44)
+        tx = pad + n + px(14) + size + 2 * ring_pad(size) + px(14)
         ex = w - pad
-        for b in (self.b_edit, self.b_go):
-            self.create_window(ex, h // 2, window=b, anchor="e")
-            ex -= b.w + px(6)
-        room = ex - tx
-        self.create_text(tx, h * 0.36, anchor="w", text=fit_one(a["alias"], FONTS["b"], room), fill=C["ink"], font=FONTS["b"])
+        for item, button in zip(self._button_items, (self.b_edit, self.b_go)):
+            self.coords(item, ex, h // 2)
+            ex -= button.w + px(6)
+        room = max(0, ex - tx)
+        self.coords(self._alias_item, tx, h * 0.36)
+        self.itemconfigure(self._alias_item, text=fit_one(a["alias"], FONTS["b"], room))
         status = a["status"] + (" · PID %d" % a["pid"] if a["tag"] == "ok" and a.get("pid") else "")
         fg, bgb = BADGE.get(a["tag"], BADGE["idle"])
         text = fit_one(status, FONTS["sb"], int(room * 0.5))
         bw, bh = FONTS["sb"].measure(text) + px(18), px(20)
-        user = self.create_text(tx, h * 0.68, anchor="w",
-                                text=fit_one("@" + a["username"], FONTS["s"], max(px(40), room - bw - px(12))),
-                                fill=C["muted"], font=FONTS["s"])
-        bx = self.bbox(user)[2] + px(10)
-        pill = ImageTk.PhotoImage(rr_image(bw, bh, bh / 2, bgb))
-        self._keep.append(pill)
-        self.create_image(bx, h * 0.68, image=pill, anchor="w")
-        self.create_text(bx + bw / 2, h * 0.68, text=text, fill=fg, font=FONTS["sb"])
+        user = fit_one("@" + a["username"], FONTS["s"], max(px(40), room - bw - px(12)))
+        self.coords(self._user_item, tx, h * 0.68)
+        self.itemconfigure(self._user_item, text=user)
+        user_box = self.bbox(self._user_item)
+        bx = (user_box[2] if user_box else tx) + px(10)
+        self._draw_round_layer(self._badge_items, bx, h * 0.68 - bh / 2, bw, bh, bh / 2, bgb)
+        self.coords(self._status_item, bx + bw / 2, h * 0.68)
+        self.itemconfigure(self._status_item, text=text, fill=fg)
 
     def _apply(self, item, ph):
         self._keep.append(ph)
@@ -2077,17 +2144,18 @@ class AddDialog:
         self.app, self.m = app, app.m
         self.tab, self.running, self.timer = "cookie", False, None
         self.win = win = app.make_dialog("Añadir cuentas", 660, 610)
-        lbl(win, "Añadir cuentas", font="h").pack(anchor="w", padx=px(28), pady=(px(24), px(14)))
-        bar = tk.Frame(win, bg=C["panel"])
+        body = win.body
+        lbl(body, "Añadir cuentas", font="h").pack(anchor="w", padx=px(28), pady=(px(24), px(14)))
+        bar = tk.Frame(body, bg=C["panel"])
         bar.pack(fill="x", padx=px(28))
         self.tabbtns = {}
         for key, text in self.TABS:
             b = Btn(bar, text, lambda k=key: self.set_tab(k), "ghost", padx=14, pady=7, radius=14, min_w=150)
             b.pack(side="left", padx=(0, px(8)))
             self.tabbtns[key] = b
-        body = tk.Frame(win, bg=C["panel"])
-        body.pack(fill="both", expand=True, padx=px(28), pady=px(14))
-        self.panes = {k: tk.Frame(body, bg=C["panel"]) for k, _ in self.TABS}
+        panes_body = tk.Frame(body, bg=C["panel"])
+        panes_body.pack(fill="both", expand=True, padx=px(28), pady=px(14))
+        self.panes = {k: tk.Frame(panes_body, bg=C["panel"]) for k, _ in self.TABS}
         wrap = px(600)
 
         p = self.panes["cookie"]
@@ -2124,7 +2192,7 @@ class AddDialog:
         self.msg_quick = lbl(p, "", "muted", wraplength=wrap)
         self.msg_quick.pack(pady=px(8))
 
-        foot = tk.Frame(win, bg=C["panel"])
+        foot = tk.Frame(body, bg=C["panel"])
         foot.pack(fill="x", padx=px(28), pady=(0, px(24)))
         self.ok = Btn(foot, self.LABEL["cookie"], self.submit, "primary", padx=20, pady=9, font="b")
         self.ok.pack(side="right")
@@ -2251,6 +2319,11 @@ class App:
             SCALE = 1.0
         root.title(APP_TITLE)
         root.configure(bg=C["bg"])
+        if IS_WINDOWS:
+            try:
+                root.attributes("-alpha", 0.0)
+            except tk.TclError:
+                pass
         root.geometry("%dx%d" % (px(1220), px(860)))
         root.minsize(px(1000), px(740))
         for key, size, weight in (("n", 10, "normal"), ("b", 10, "bold"), ("s", 9, "normal"), ("sb", 9, "bold"),
@@ -2273,11 +2346,13 @@ class App:
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.bind_all("<MouseWheel>", self._wheel)
-        root.deiconify()
         root.update_idletasks()
-        self.dark_titlebar(root)
-        self._pump()
         self.tick()
+        root.deiconify()
+        self.dark_titlebar(root)
+        if IS_WINDOWS:
+            root.after(35, lambda: root.attributes("-alpha", 1.0) if root.winfo_exists() else None)
+        self._pump()
         self.bg(self.m.game_sorts, self._sorts_done)
 
     def _report_callback_exception(self, exc, value, tb):
@@ -2322,27 +2397,60 @@ class App:
             return
         try:
             import ctypes
-            hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetParent.restype = wintypes.HWND
+            hwnd = user32.GetParent(wintypes.HWND(win.winfo_id()))
+            dwmapi = ctypes.windll.dwmapi
+            dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
             for attr in (20, 19):
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(ctypes.c_int(1)), 4)
+                value = ctypes.c_int(1)
+                dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(value), ctypes.sizeof(value))
+            # Keep Windows' native caption controls and resize handling, while
+            # blending the caption text/border into the app's dark background.
+            caption = ctypes.c_int(0x000B0808)  # COLORREF #08080b
+            text = ctypes.c_int(0x000B0808)
+            for attr, color in ((34, caption), (35, caption), (36, text)):
+                dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(color), ctypes.sizeof(color))
+            # WM_SETICON/ICON_SMALL hides the caption icon; ICON_BIG remains for the taskbar.
+            user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            user32.SendMessageW(hwnd, 0x0080, 0, 0)
         except Exception:  # noqa: BLE001
-            pass
+            log.exception("No se pudo personalizar la barra de título")
 
     def make_dialog(self, title, w, h=None):
         win = tk.Toplevel(self.root)
         win.title(title)
-        win.configure(bg=C["panel"])
+        win.overrideredirect(True)
+        win.configure(bg="#101014")
         win.transient(self.root)
         win.resizable(False, False)
         win.iconphoto(False, *self.icons)
-        win.geometry(self._center(px(w), px(h or 300)))
-        win.update_idletasks()
-        self.dark_titlebar(win)
+        self.root.update_idletasks()
+        width, height = px(w), px(h or 300)
+        root_x, root_y = self.root.winfo_rootx(), self.root.winfo_rooty()
+        root_w, root_h = max(1, self.root.winfo_width()), max(1, self.root.winfo_height())
+        win.geometry("%dx%d+%d+%d" % (root_w, root_h, root_x, root_y))
         try:
-            win.wait_visibility()
-            win.grab_set()
-        except tk.TclError:
-            pass
+            self.root.update_idletasks()
+            backdrop = ImageGrab.grab(bbox=(root_x, root_y, root_x + root_w, root_y + root_h)).convert("RGB")
+            backdrop = backdrop.resize((root_w, root_h), Image.Resampling.LANCZOS)
+            backdrop = Image.blend(backdrop, Image.new("RGB", (root_w, root_h), C["bg"]), 0.38)
+            backdrop = backdrop.filter(ImageFilter.GaussianBlur(radius=max(1, px(1))))
+            win.backdrop = ImageTk.PhotoImage(backdrop)
+            shade = tk.Label(win, image=win.backdrop, bg=C["bg"], bd=0, highlightthickness=0)
+        except Exception:  # noqa: BLE001
+            log.exception("No se pudo capturar el fondo del diálogo")
+            win.backdrop = None
+            shade = tk.Frame(win, bg=C["bg"])
+        shade.place(x=0, y=0, relwidth=1, relheight=1)
+        panel = Panel(shade, fill=C["panel"], border=C["line2"], radius=16)
+        panel.place(relx=0.5, rely=0.5, anchor="center", width=width, height=height)
+        win.dialog_panel = panel
+        win.body = panel.body
+        win.update_idletasks()
+        win.lift()
         return win
 
     def _center(self, w, h):
@@ -2353,10 +2461,11 @@ class App:
     def ask(self, title, text, buttons, width=460):
         """Diálogo con botones propios. buttons: [(texto, valor, estilo)] de izquierda a derecha. Devuelve el valor."""
         win = self.make_dialog(title, width)
+        body = win.body
         out = {"v": None}
-        lbl(win, title, "ink", "t").pack(anchor="w", padx=px(28), pady=(px(24), px(8)))
-        lbl(win, text, "muted", wraplength=px(width - 56), justify="left").pack(anchor="w", padx=px(28))
-        row = tk.Frame(win, bg=C["panel"])
+        lbl(body, title, "ink", "t").pack(anchor="w", padx=px(28), pady=(px(24), px(8)))
+        lbl(body, text, "muted", wraplength=px(width - 56), justify="left").pack(anchor="w", padx=px(28))
+        row = tk.Frame(body, bg=C["panel"])
         row.pack(fill="x", padx=px(28), pady=px(24))
 
         def pick(v):
@@ -2366,16 +2475,40 @@ class App:
             Btn(row, label, lambda v=value: pick(v), kind, padx=16, pady=8).pack(side="right", padx=(px(8), 0))
         win.bind("<Escape>", lambda e: win.destroy())
         win.update_idletasks()
-        win.geometry(self._center(px(width), win.winfo_reqheight()))
+        panel = win.dialog_panel
+        panel.place_configure(height=body.winfo_reqheight() + px(16))
         self.root.wait_window(win)
         return out["v"]
 
+    def ask_async(self, title, text, buttons, on_result, width=460):
+        """Muestra una confirmación sin detener el ciclo de eventos de la ventana principal."""
+        win = self.make_dialog(title, width)
+        body = win.body
+        lbl(body, title, "ink", "t").pack(anchor="w", padx=px(28), pady=(px(24), px(8)))
+        lbl(body, text, "muted", wraplength=px(width - 56), justify="left").pack(anchor="w", padx=px(28))
+        row = tk.Frame(body, bg=C["panel"])
+        row.pack(fill="x", padx=px(28), pady=px(24))
+        panel = win.dialog_panel
+
+        def finish(value=None):
+            if not win.winfo_exists():
+                return
+            win.destroy()
+            on_result(value)
+
+        for label, value, kind in reversed(buttons):
+            Btn(row, label, lambda v=value: finish(v), kind, padx=16, pady=8).pack(side="right", padx=(px(8), 0))
+        win.bind("<Escape>", lambda _e: finish())
+        win.update_idletasks()
+        panel.place_configure(height=body.winfo_reqheight() + px(16))
+
     def ask_text(self, title, prompt, initial=""):
         win = self.make_dialog(title, 440, 190)
+        body = win.body
         out = {"v": None}
-        lbl(win, prompt, "ink", "b").pack(anchor="w", padx=px(28), pady=(px(26), px(10)))
+        lbl(body, prompt, "ink", "b").pack(anchor="w", padx=px(28), pady=(px(26), px(10)))
         var = tk.StringVar(value=initial)
-        f = Field(win, var)
+        f = Field(body, var)
         f.pack(fill="x", padx=px(28))
         f.entry.focus_set()
         f.entry.select_range(0, "end")
@@ -2383,7 +2516,7 @@ class App:
         def ok(_e=None):
             out["v"] = var.get().strip()
             win.destroy()
-        row = tk.Frame(win, bg=C["panel"])
+        row = tk.Frame(body, bg=C["panel"])
         row.pack(fill="x", padx=px(28), pady=px(22))
         Btn(row, "Guardar", ok, "primary", padx=18, pady=8).pack(side="right")
         Btn(row, "Cancelar", win.destroy, "ghost", padx=16, pady=8).pack(side="right", padx=(0, px(10)))
@@ -2496,7 +2629,7 @@ class App:
         pad = px(26)
 
         head = tk.Frame(root, bg=C["bg"])
-        head.grid(row=0, column=0, sticky="ew", padx=pad, pady=(px(22), px(12)))
+        head.grid(row=0, column=0, sticky="ew", padx=pad, pady=(px(14), px(12)))
         self._logo = ImageTk.PhotoImage(draw_logo(px(48)))
         tk.Label(head, bg=C["bg"], image=self._logo).pack(side="left")
         titles = tk.Frame(head, bg=C["bg"])
@@ -2553,6 +2686,7 @@ class App:
         self.search = Field(rb, self.search_var, "Buscar un juego…")
         self.search.pack(fill="x", padx=px(18))
         self.search_var.trace_add("write", lambda *a: self.on_search_typed())
+        self.search.entry.bind("<Return>", self._search_enter)
         self.chips = ChipBar(rb, self.on_category)
         self.chips.pack(fill="x", padx=px(18), pady=(px(12), 0))
         self.gmsg = lbl(rb, "", "muted", "s", bg=C["panel"], wraplength=px(560), justify="left")
@@ -2802,9 +2936,12 @@ class App:
         self.close_ids(list(self.sel))
 
     def close_all(self):
-        if self.ask("Cerrar todas las instancias", "¿Cerrar todas las instancias de Roblox abiertas, incluidas las que no se lanzaron "
-                    "desde aquí?", [("Cancelar", None, "ghost"), ("Cerrar todos", "yes", "danger")]):
-            self.bg(lambda: self.m.close([], True), lambda r, e: self.refresh())
+        def confirmed(answer):
+            if answer:
+                self.bg(lambda: self.m.close([], True), lambda r, e: self.refresh())
+
+        self.ask_async("Cerrar todas las instancias", "¿Cerrar todas las instancias de Roblox abiertas, incluidas las que no se lanzaron "
+                       "desde aquí?", [("Cancelar", None, "ghost"), ("Cerrar todos", "yes", "danger")], confirmed)
 
     def toggle_multi(self):
         on = bool(self.state and self.state["multi"]["active"])
@@ -2835,12 +2972,28 @@ class App:
             self.root.after(15000, lambda: self.bg(self.m.game_sorts, self._sorts_done))
         self.sorts = sorts
         self.cat_id = sorts[0]["id"] if sorts else "fav"
-        self.chips.set_items([("fav", "★ Favoritos")] + [(s["id"], s["name"]) for s in sorts], self.cat_id)
-        self.load_category()
+        searching = bool(self.search_var.get().strip())
+        self.chips.set_items([("fav", "★ Favoritos")] + [(s["id"], s["name"]) for s in sorts],
+                             None if searching else self.cat_id)
+        if not searching:
+            self.load_category()
 
     def on_category(self, cat_id):
         self.cat_id = cat_id
+        if self.search_job:
+            try:
+                self.root.after_cancel(self.search_job)
+            except tk.TclError:
+                pass
+            self.search_job = None
         self.search_var.set("")
+        # The trace schedules an empty search; category loading below replaces it.
+        if self.search_job:
+            try:
+                self.root.after_cancel(self.search_job)
+            except tk.TclError:
+                pass
+            self.search_job = None
         self.load_category()
 
     def load_category(self):
@@ -2851,10 +3004,24 @@ class App:
 
     def on_search_typed(self):
         if self.search_job:
-            self.root.after_cancel(self.search_job)
+            try:
+                self.root.after_cancel(self.search_job)
+            except tk.TclError:
+                pass
         self.search_job = self.root.after(300, self.run_search)
 
+    def _search_enter(self, _event=None):
+        if self.search_job:
+            try:
+                self.root.after_cancel(self.search_job)
+            except tk.TclError:
+                pass
+        self.search_job = None
+        self.run_search()
+        return "break"
+
     def run_search(self):
+        self.search_job = None
         q = self.search_var.get().strip()
         if len(q) >= 2:
             self.chips.set_current(None)
@@ -2862,6 +3029,10 @@ class App:
         elif not q and self.cat_id:
             self.chips.set_current(self.cat_id)
             self.load_category()
+        elif q:
+            self.greq += 1
+            self.clear_cards()
+            self.set_gmsg("Escribe al menos 2 caracteres para buscar.")
 
     def set_gmsg(self, text, bad=False):
         self.gmsg.configure(text=text, fg=C["bad"] if bad else C["muted"])
@@ -2907,7 +3078,7 @@ class App:
             icon = icons.get(place["place_id"])
             if icon and place["place_id"] in current_ids:
                 self.m.store.add_place(place["name"], place["place_id"], place.get("universe_id"), icon)
-        if self.cat_id == "fav":
+        if self.cat_id == "fav" and not self.search_var.get().strip():
             self.show_favs()
 
     def clear_cards(self):
@@ -2920,19 +3091,30 @@ class App:
         place = parse_place(self.place_var.get())
         for g in games:
             self.game_cards.append(GameCard(self, self.games_sf.inner, g, bool(place and g["place_id"] == place), fav))
-        self.layout_games()
+        self.layout_games(force=True)
         self.games_sf.canvas.yview_moveto(0)
 
-    def _games_resized(self, _e=None):
+    def _games_resized(self, e=None):
+        width = e.width if e else self.games_sf.canvas.winfo_width()
+        cols = max(1, width // (px(GameCard.W) + px(12)))
+        if cols == getattr(self, "_game_cols", None):
+            return
         if self.layout_job:
             self.root.after_cancel(self.layout_job)
-        self.layout_job = self.root.after(60, self.layout_games)
+        self.layout_job = self.root.after_idle(self.layout_games)
 
-    def layout_games(self):
+    def layout_games(self, force=False):
+        self.layout_job = None
         w = self.games_sf.canvas.winfo_width()
         cols = max(1, w // (px(GameCard.W) + px(12)))
-        for c in range(16):
-            self.games_sf.inner.grid_columnconfigure(c, weight=1 if c < cols else 0, uniform="g" if c < cols else "")
+        cols_changed = cols != getattr(self, "_game_cols", None)
+        if not cols_changed and not force:
+            return
+        self._game_cols = cols
+        if cols_changed:
+            for c in range(16):
+                self.games_sf.inner.grid_columnconfigure(c, weight=1 if c < cols else 0,
+                                                        uniform="g" if c < cols else "")
         for i, card in enumerate(self.game_cards):
             card.grid(row=i // cols, column=i % cols, padx=px(5), pady=px(5))
 

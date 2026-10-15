@@ -8,6 +8,8 @@ venv/
 build/
 dist/
 *.spec
+/LuxkorAccountManager.exe
+/LuxkorAccountManager.exe.sha256
 
 # Datos del usuario: NUNCA subir (contienen cookies cifradas)
 data.json
