@@ -21,6 +21,8 @@ import base64
 import concurrent.futures
 import copy
 import csv
+import hashlib
+import http.client
 import io
 import json
 import logging
@@ -60,6 +62,7 @@ APP_VERSION = "1.2.2"
 IS_WINDOWS = os.name == "nt"
 PLAYER_EXE = "RobloxPlayerBeta.exe"
 MUTEX_NAME = "ROBLOX_singletonMutex"
+EVENT_NAME = "ROBLOX_singletonEvent"
 ERROR_ALREADY_EXISTS = 183
 CREATE_NO_WINDOW = 0x08000000
 USER_AGENT = (
@@ -611,11 +614,39 @@ def cookie_host_ok(url: str) -> bool:
     return parts.scheme == "https" and roblox_domain(parts.hostname)
 
 
+class _ConnPool:
+    """Conexiones HTTP(S) que se reutilizan: abrir una nueva (saludo TLS) cuesta más que la propia petición."""
+
+    def __init__(self, max_idle: int = 8, idle_secs: float = 25.0):
+        self.lock, self.idle, self.max_idle, self.idle_secs = threading.Lock(), {}, max_idle, idle_secs
+
+    def get(self, key, timeout):
+        with self.lock:
+            lst = self.idle.get(key, [])
+            while lst:
+                conn, stamp = lst.pop()
+                if time.time() - stamp < self.idle_secs:
+                    return conn, True
+                conn.close()
+        cls = http.client.HTTPSConnection if key[0] == "https" else http.client.HTTPConnection
+        return cls(key[1], key[2], timeout=timeout), False
+
+    def put(self, key, conn):
+        with self.lock:
+            lst = self.idle.setdefault(key, [])
+            if len(lst) < self.max_idle:
+                lst.append((conn, time.time()))
+                return
+        conn.close()
+
+
 class RobloxAPI:
     def __init__(self, users_base="https://users.roblox.com", auth_base="https://auth.roblox.com",
                  timeout=15, thumbs_base="https://thumbnails.roblox.com", img_ok=roblox_img_ok,
                  apis_base="https://apis.roblox.com", games_base="https://games.roblox.com", strict=True):
         self.strict = strict  # las pruebas con servidores locales lo desactivan
+        self._pool = _ConnPool()
+        self._csrf, self._csrf_lock = {}, threading.Lock()
         self.games_base = games_base.rstrip("/")
         self.apis_base = apis_base.rstrip("/")
         self.users_base = users_base.rstrip("/")
@@ -627,6 +658,14 @@ class RobloxAPI:
     def _request(self, method, url, headers, body=None):
         if self.strict and any(k.lower() == "cookie" for k in headers) and not cookie_host_ok(url):
             raise RobloxError("Por seguridad, la cookie solo se envía por HTTPS a roblox.com.")
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme in ("http", "https") and parts.hostname:
+            try:
+                return self._pooled_request(method, parts, headers, body)
+            except TimeoutError as err:
+                raise RobloxError("No hay conexión con Roblox (%s). Revisa tu internet." % err) from err
+            except (http.client.HTTPException, OSError):
+                pass  # p. ej. detrás de un proxy: se usa el camino normal de urllib
         req = urllib.request.Request(url, data=body, method=method, headers=headers)
         try:
             with _OPENER.open(req, timeout=self.timeout) as resp:
@@ -636,6 +675,30 @@ class RobloxAPI:
         except (urllib.error.URLError, OSError) as err:
             reason = getattr(err, "reason", err)
             raise RobloxError("No hay conexión con Roblox (%s). Revisa tu internet." % reason) from err
+
+    def _pooled_request(self, method, parts, headers, body):
+        """Petición con conexión reutilizada. No sigue redirecciones: un 3xx se devuelve tal cual."""
+        key = (parts.scheme, parts.hostname, parts.port or (443 if parts.scheme == "https" else 80))
+        path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        hdrs = dict(headers)
+        hdrs.setdefault("Accept-Encoding", "identity")
+        for attempt in (0, 1):
+            conn, reused = self._pool.get(key, self.timeout)
+            try:
+                conn.request(method, path, body=body, headers=hdrs)
+                resp = conn.getresponse()
+                data = resp.read()
+            except (http.client.HTTPException, OSError):
+                conn.close()
+                if reused and attempt == 0:  # el servidor ya había cerrado esa conexión inactiva: se prueba con una nueva
+                    continue
+                raise
+            if resp.will_close:
+                conn.close()
+            else:
+                self._pool.put(key, conn)
+            return resp.status, resp.headers, data
+        raise OSError("sin conexión")
 
     @staticmethod
     def _headers(cookie, extra=None):
@@ -682,7 +745,21 @@ class RobloxAPI:
         except (ValueError, KeyError, TypeError, AttributeError) as err:
             raise RobloxError("Roblox devolvió avatares que no se entienden.") from err
 
-    def auth_ticket(self, cookie: str, place_id: int) -> str:
+    CSRF_TTL = 600  # segundos que se reutiliza un token CSRF; si caduca antes, Roblox da uno nuevo y se reintenta
+
+    def _csrf_key(self, cookie: str) -> str:
+        return hashlib.sha256(cookie.encode("utf-8")).hexdigest()
+
+    def _csrf_get(self, key: str):
+        with self._csrf_lock:
+            hit = self._csrf.get(key)
+            return hit[0] if hit and time.time() - hit[1] < self.CSRF_TTL else None
+
+    def _csrf_put(self, key: str, token: str) -> None:
+        with self._csrf_lock:
+            self._csrf[key] = (token, time.time())
+
+    def _ticket_request(self, cookie: str, place_id: int):
         url = self.auth_base + "/v1/authentication-ticket"
         extra = {
             "Content-Type": "application/json",
@@ -690,11 +767,30 @@ class RobloxAPI:
             "Origin": "https://www.roblox.com",
             "RBX-For-Gameauth": "true",
         }
-        headers = self._headers(cookie, extra)
+        return url, self._headers(cookie, extra)
+
+    def warm(self, cookie: str) -> None:
+        """Se adelanta al lanzamiento: consigue el token CSRF y deja la conexión abierta.
+        Sin token Roblox responde 403 con el token y NO crea ningún ticket."""
+        url, headers = self._ticket_request(cookie, 1)
         status, resp_headers, _ = self._request("POST", url, headers, b"{}")
         if status == 403 and resp_headers.get("x-csrf-token"):
-            headers["X-CSRF-TOKEN"] = resp_headers["x-csrf-token"]
+            self._csrf_put(self._csrf_key(cookie), resp_headers["x-csrf-token"])
+
+    def auth_ticket(self, cookie: str, place_id: int) -> str:
+        url, headers = self._ticket_request(cookie, place_id)
+        key = self._csrf_key(cookie)
+        token = self._csrf_get(key)
+        if token:  # con el token ya guardado basta UNA petición (antes eran dos)
+            headers["X-CSRF-TOKEN"] = token
+        status, resp_headers, _ = self._request("POST", url, headers, b"{}")
+        if status == 403 and resp_headers.get("x-csrf-token"):
+            token = resp_headers["x-csrf-token"]
+            self._csrf_put(key, token)
+            headers["X-CSRF-TOKEN"] = token
             status, resp_headers, _ = self._request("POST", url, headers, b"{}")
+        elif status == 200 and token:
+            self._csrf_put(key, token)
         if status == 401:
             raise AuthExpired("Cookie caducada")
         if status == 429:
@@ -870,19 +966,92 @@ class RobloxAPI:
 # --------------------------------------------------------------------------------------
 # Plataforma (procesos, multi-instancia, lanzamiento)
 # --------------------------------------------------------------------------------------
+def process_cmdline(pid: int):
+    """Línea de comandos de un proceso del mismo usuario (None si Windows no deja leerla)."""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ntdll.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
+                                                ctypes.POINTER(wintypes.ULONG)]
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+    handle = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        size = wintypes.ULONG(0)
+        ntdll.NtQueryInformationProcess(handle, 60, None, 0, ctypes.byref(size))  # 60 = ProcessCommandLineInformation
+        if not size.value:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if ntdll.NtQueryInformationProcess(handle, 60, buf, size.value, ctypes.byref(size)) != 0:
+            return None
+        length = struct.unpack_from("<H", buf, 0)[0]  # UNICODE_STRING: Length, MaximumLength, (relleno), Buffer
+        ptr = struct.unpack_from("<Q" if ctypes.sizeof(ctypes.c_void_p) == 8 else "<I", buf,
+                                 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 4)[0]
+        return ctypes.wstring_at(ptr, length // 2) if ptr and length else None
+    finally:
+        k32.CloseHandle(handle)
+
+
+def toolhelp_pids(exe_name: str):
+    """PIDs de los procesos con ese nombre, con la instantánea de procesos de Windows (~1 ms, sin lanzar nada)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32FirstW.restype = wintypes.BOOL
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32NextW.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if snap in (None, ctypes.c_void_p(-1).value):
+        raise OSError("No se pudo leer la lista de procesos")
+    pids, want = [], exe_name.lower()
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() == want:
+                pids.append(int(entry.th32ProcessID))
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    return sorted(pids)
+
+
 def _sys32(name: str) -> str:
     """Ruta completa de una herramienta de Windows (evita ejecutar un .exe falso de la carpeta actual)."""
     return os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", name)
 
 
 class WindowsPlatform:
-    def __init__(self):
-        self._mutex = None
+    def __init__(self, mutex_name=MUTEX_NAME, event_name=EVENT_NAME):
+        self._mutex = self._event_guard = None
+        self.mutex_name, self.event_name = mutex_name, event_name
 
     def launch(self, uri: str) -> None:
         os.startfile(uri)  # noqa: S606  (abre el manejador del protocolo roblox-player:)
 
     def list_pids(self):
+        try:
+            return toolhelp_pids(PLAYER_EXE)
+        except Exception:  # noqa: BLE001
+            pass  # si falla la API nativa, se pregunta a tasklist como antes
         try:
             out = subprocess.run(
                 [_sys32("tasklist.exe"), "/FI", "IMAGENAME eq " + PLAYER_EXE, "/FO", "CSV", "/NH"],
@@ -891,6 +1060,12 @@ class WindowsPlatform:
         except (OSError, subprocess.SubprocessError):
             return []
         return parse_tasklist(out.stdout.decode("utf-8", "replace"))
+
+    def cmdline(self, pid: int):
+        try:
+            return process_cmdline(pid)
+        except Exception:  # noqa: BLE001
+            return None
 
     def kill_pid(self, pid: int) -> None:
         subprocess.run([_sys32("taskkill.exe"), "/PID", str(int(pid)), "/F", "/T"],
@@ -901,8 +1076,12 @@ class WindowsPlatform:
                        capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15)
 
     def multi_enable(self):
-        """Crea ROBLOX_singletonMutex antes que el cliente. Devuelve (activa, detalle)."""
-        if self._mutex:
+        """Toma ROBLOX_singletonMutex y ROBLOX_singletonEvent antes que el cliente. Devuelve (activa, detalle).
+
+        El Roblox actual cierra la ventana anterior cuando se abre una nueva si existe el *evento*
+        ROBLOX_singletonEvent. Reclamamos ese nombre con un *mutex*: Roblox no puede crear un evento con un
+        nombre que ya es de otro tipo, y las ventanas ya abiertas dejan de recibir la orden de cerrarse."""
+        if self._mutex and self._event_guard:
             return True, ""
         import ctypes
         from ctypes import wintypes
@@ -912,30 +1091,48 @@ class WindowsPlatform:
         k32.CreateMutexW.restype = wintypes.HANDLE
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
         ctypes.set_last_error(0)
-        handle = k32.CreateMutexW(None, True, MUTEX_NAME)
+        handle = k32.CreateMutexW(None, True, self.mutex_name)
         err = ctypes.get_last_error()
         if not handle:
             return False, "Windows no permitió crear el bloqueo (código %d)." % err
+        note = ""
         if err == ERROR_ALREADY_EXISTS:
             if self.list_pids():
                 k32.CloseHandle(handle)
                 return False, ("Había un Roblox abierto antes de activar la multi-instancia. "
                                "Ciérralos y pulsa Reintentar.")
-            self._mutex = handle
-            return True, "Otro programa (Fishstrap, Bloxstrap…) ya mantenía el bloqueo; lo compartimos."
-        self._mutex = handle
-        return True, ""
+            note = "Otro programa (Fishstrap, Bloxstrap…) ya mantenía el bloqueo; lo compartimos."
+        ctypes.set_last_error(0)
+        guard = k32.CreateMutexW(None, True, self.event_name)
+        if not guard:  # el nombre ya es un evento: lo creó un Roblox que sigue abierto
+            k32.CloseHandle(handle)
+            return False, self._event_busy_detail()
+        self._mutex, self._event_guard = handle, guard
+        return True, note
+
+    def _event_busy_detail(self) -> str:
+        pids = []
+        try:
+            pids = self.list_pids()
+        except Exception:  # noqa: BLE001
+            pass
+        if any("--launch-to-tray" in (self.cmdline(pid) or "") for pid in pids):
+            return ("Roblox está abierto en segundo plano (icono de la bandeja del sistema) y bloquea la "
+                    "multi-instancia. Ciérralo y pulsa Reintentar.")
+        return "Hay un Roblox abierto que bloquea la multi-instancia. Ciérralos todos y pulsa Reintentar."
 
     def multi_disable(self) -> None:
-        if not self._mutex:
+        if not (self._mutex or self._event_guard):
             return
         import ctypes
         from ctypes import wintypes
 
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
-        k32.CloseHandle(self._mutex)
-        self._mutex = None
+        for handle in (self._mutex, self._event_guard):
+            if handle:
+                k32.CloseHandle(handle)
+        self._mutex = self._event_guard = None
 
 
 class NullPlatform:
@@ -946,6 +1143,9 @@ class NullPlatform:
 
     def list_pids(self):
         return []
+
+    def cmdline(self, pid):
+        return None
 
     def kill_pid(self, pid):
         pass
@@ -978,6 +1178,7 @@ class Manager:
         self.multi_detail = ""
         self.cancel = threading.Event()
         self.worker = None
+        self._warm = {}
         self.login = None
         self.session_id = str(uuid.uuid4())
         self._gcache = {}
@@ -1374,17 +1575,21 @@ class Manager:
         self.store.add_place(name, place, game.get("universe_id"), game.get("icon"))
 
     # -- lanzar y cerrar
-    def launch(self, ids, place_text, job_text, delay):
+    def launch(self, ids, place_text, job_text, delay, parallel=False):
+        """parallel=True abre todas las cuentas a la vez, sin pausa entre ellas ni esperar a cada una."""
         place = parse_place(place_text)
         if place is None:
-            raise ValueError("Escribe el ID o el enlace del juego (por ejemplo https://www.roblox.com/games/1818).")
+            raise ValueError("Elige primero un juego de la lista.")
         job = (job_text or "").strip() or None
         if job and not valid_job(job):
             raise ValueError("El servidor tiene que ser un JobId con formato xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.")
-        try:
-            delay = max(0.0, min(120.0, float(delay)))
-        except (TypeError, ValueError):
-            raise ValueError("La pausa tiene que ser un número de segundos.")
+        if parallel:
+            delay = 0.0
+        else:
+            try:
+                delay = max(0.0, min(120.0, float(delay)))
+            except (TypeError, ValueError):
+                raise ValueError("La pausa tiene que ser un número de segundos.")
         ids = [i for i in dict.fromkeys(ids) if self.store.get(i)]
         if not ids:
             raise ValueError("Selecciona al menos una cuenta.")
@@ -1398,13 +1603,26 @@ class Manager:
             if not isinstance(self.plat, NullPlatform) and not self.multi_active and (self.known_pids or len(todo) > 1):
                 raise ValueError("La multi-instancia no está activa: Roblox cerraría la partida que ya está abierta. "
                                  "Actívala arriba (cierra antes los Roblox abiertos si hace falta).")
-            self.store.update_settings(place=str(place_text)[:200], job=job or "", delay=delay)
+            settings = {"place": str(place_text)[:200], "job": job or ""}
+            if not parallel:  # la pausa guardada es del modo "una a una": a la vez no la toca
+                settings["delay"] = delay
             self.cancel.clear()
             for i in todo:
                 self.set_status(i, "En cola", "busy")
-            self.worker = threading.Thread(target=self._launch_worker, args=(todo, place, job, delay), daemon=True)
+            saver = threading.Thread(target=self._save_launch_settings, args=(settings,), daemon=True)
+            saver.start()  # escribir en disco no retrasa el lanzamiento
+
+            def run():
+                try:
+                    if parallel:
+                        self._launch_parallel(todo, place, job)
+                    else:
+                        self._launch_worker(todo, place, job, delay)
+                finally:
+                    saver.join(5)
+            self.worker = threading.Thread(target=run, daemon=True)
             self.worker.start()
-        return {"started": len(todo), "skipped": skipped}
+        return {"started": len(todo), "skipped": skipped, "parallel": bool(parallel)}
 
     def _launch_worker(self, ids, place, job, delay):
         try:
@@ -1442,6 +1660,110 @@ class Manager:
         except (RobloxError, SecretError, OSError, ValueError) as err:
             log.warning("Fallo lanzando %s: %s", aid, err)
             self.set_status(aid, "Error: %s" % err, "bad")
+
+    def _save_launch_settings(self, settings):
+        try:
+            self.store.update_settings(**settings)
+        except Exception:  # noqa: BLE001
+            log.exception("No se pudieron guardar los ajustes del lanzamiento")
+
+    def prewarm(self, ids):
+        """Al seleccionar cuentas: pide ya el token CSRF y abre la conexión, para que «Lanzar» tarde menos."""
+        now = time.time()
+        todo = [i for i in ids if now - self._warm.get(i, 0) > 240]
+        if not todo:
+            return
+        for i in todo:
+            self._warm[i] = now
+
+        def work(aid):
+            try:
+                self.api.warm(self.store.cookie(aid))
+            except Exception as err:  # noqa: BLE001
+                log.debug("Precalentamiento fallido: %s", err)  # es solo un adelanto: el lanzamiento lo hará por su cuenta
+
+        def run():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(todo), 8)) as pool:
+                list(pool.map(work, todo))
+        threading.Thread(target=run, daemon=True).start()
+
+    PID_WAIT = 25  # segundos que se espera a que aparezcan todas las ventanas de Roblox
+
+    def _launch_parallel(self, ids, place, job):
+        """Abre todas las cuentas a la vez. Cada una pide su ticket y lanza su ventana sin esperar a las demás."""
+        try:
+            for aid in ids:
+                self.set_status(aid, "Pidiendo acceso…", "busy")
+            before = set(self.plat.list_pids())  # procesos que ya había, antes de abrir nada
+            launched, lock = [], threading.Lock()  # (cuenta, trackerId): el trackerId viaja en la línea de comandos
+
+            def one(aid):
+                try:
+                    ticket = self.api.auth_ticket(self.store.cookie(aid), place)
+                except AuthExpired:
+                    self.set_status(aid, "Cookie caducada", "bad")
+                    return
+                except (RobloxError, SecretError, OSError, ValueError) as err:
+                    log.warning("Fallo pidiendo acceso para %s: %s", aid, err)
+                    self.set_status(aid, "Error: %s" % err, "bad")
+                    return
+                if self.cancel.is_set():
+                    self.set_status(aid, "Cancelada", "idle")
+                    return
+                tracker = str(random.randint(10_000_000_000, 99_999_999_999))
+                self.set_status(aid, "Abriendo Roblox…", "busy")
+                with lock:  # lanzar y anotar van juntos: el orden anotado es el orden real de las ventanas
+                    try:
+                        self.plat.launch(build_launch_uri(ticket, place, job, tracker))
+                    except (RobloxError, OSError) as err:
+                        log.warning("Fallo lanzando %s: %s", aid, err)
+                        self.set_status(aid, "Error: %s" % err, "bad")
+                        return
+                    launched.append((aid, tracker))
+                self.store.update_account(aid, last_launch=int(time.time()))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(ids), 8))) as pool:
+                list(pool.map(one, ids))
+            self._assign_pids(launched, before)
+        except Exception:  # noqa: BLE001
+            log.exception("Fallo inesperado en el lanzamiento a la vez")
+            for aid in ids:
+                if self.status.get(aid, {}).get("tag") == "busy":
+                    self.set_status(aid, "Error inesperado (mira app.log)", "bad")
+
+    def _assign_pids(self, launched, before):
+        """Relaciona cada cuenta con su proceso de Roblox.
+        Exacto si Windows deja leer la línea de comandos (lleva el trackerId); si no, por orden de aparición."""
+        if not launched:
+            return
+        found, deadline = {}, time.time() + self.PID_WAIT
+        new = []
+        while True:
+            new = sorted(p for p in self.plat.list_pids() if p not in before)
+            taken = set(found.values())
+            for pid in new:
+                if pid in taken:
+                    continue
+                cmd = self.plat.cmdline(pid) or ""
+                for aid, tracker in launched:
+                    if aid not in found and tracker in cmd:
+                        found[aid] = pid
+                        break
+            if len(found) == len(launched) or len(new) >= len(launched) or time.time() >= deadline \
+                    or self.cancel.is_set():
+                break
+            self.cancel.wait(0.2)
+        left_accounts = [aid for aid, _t in launched if aid not in found]
+        left_pids = [p for p in new if p not in found.values()]
+        if left_accounts and len(left_accounts) == len(left_pids):  # sin línea de comandos: por orden de aparición
+            found.update(zip(left_accounts, left_pids))
+        with self.lock:
+            for aid, _t in launched:
+                if aid in found:
+                    self.pids[aid] = found[aid]
+                    self.status[aid] = {"text": "Abierta", "tag": "ok"}
+                else:
+                    self.status[aid] = {"text": "Lanzada, sin confirmar", "tag": "warn"}
 
     def _wait_new_pid(self, before, timeout):
         deadline = time.time() + timeout
@@ -1962,14 +2284,10 @@ class ChipBar(tk.Frame):
 class AccountRow(tk.Canvas):
     H = 76
 
-    def __init__(self, app, parent, a, idx, sel, busy):
+    def __init__(self, app, parent, a, idx, sel):
         self.app, self.a, self.idx, self.sel = app, a, idx, sel
         self.bgc = C["selected"] if sel else C["card"]
         super().__init__(parent, bg=C["panel"], height=px(self.H), highlightthickness=0, bd=0, cursor="hand2")
-        running = a["tag"] == "ok"
-        self.b_go = Btn(self, "Abierta" if running else "Lanzar", lambda: app.do_launch([a["id"]]), "primary",
-                        padx=14, pady=6, font="s", min_w=78, bg=self.bgc)
-        self.b_go.set_enabled(not busy and not running)
         self.b_edit = Btn(self, "✎", lambda: app.rename(a["id"], a["alias"]), "ghost", padx=10, pady=6, font="s", bg=self.bgc)
         self._bg_outer = self._make_round_layer("background", C["line"])
         self._bg_inner = self._make_round_layer("background", self.bgc)
@@ -2028,7 +2346,7 @@ class AccountRow(tk.Canvas):
         self.app.set_image(a.get("avatar"), "avatar", size, a["alias"] or a["username"],
                            lambda ph, it=self._avatar_item: self._apply(it, ph), RING.get(a["tag"], RING["idle"]))
         self._button_items = [self.create_window(0, h // 2, window=b, anchor="e", tags=("content",))
-                              for b in (self.b_edit, self.b_go)]
+                              for b in (self.b_edit,)]
         self._alias_item = self.create_text(0, h * 0.36, anchor="w", fill=C["ink"], font=FONTS["b"],
                                             tags=("content",))
         self._user_item = self.create_text(0, h * 0.68, anchor="w", fill=C["muted"], font=FONTS["s"],
@@ -2049,7 +2367,7 @@ class AccountRow(tk.Canvas):
         pad, n, size = px(16), px(22), px(44)
         tx = pad + n + px(14) + size + 2 * ring_pad(size) + px(14)
         ex = w - pad
-        for item, button in zip(self._button_items, (self.b_edit, self.b_go)):
+        for item, button in zip(self._button_items, (self.b_edit,)):
             self.coords(item, ex, h // 2)
             ex -= button.w + px(6)
         room = max(0, ex - tx)
@@ -2695,40 +3013,25 @@ class App:
         self.games_sf.pack(fill="both", expand=True, padx=(px(14), px(6)), pady=(px(6), px(16)))
         self.games_sf.canvas.bind("<Configure>", self._games_resized, add="+")
 
-        # pie: juego + opciones + acciones
-        foot = Panel(root)
+        # pie: servidor (opcional) + acciones
+        foot = Panel(root, height=px(84))  # sin altura el panel quedaba en 0 px y el pie no se veía
         foot.grid(row=3, column=0, sticky="ew", padx=pad, pady=(px(12), px(16)))
-        fb = foot.body
-        r1 = tk.Frame(fb, bg=C["panel"])
-        r1.pack(fill="x", padx=px(18), pady=(px(12), px(6)))
+        r1 = tk.Frame(foot.body, bg=C["panel"])
+        r1.pack(fill="x", padx=px(18), pady=(px(14), px(14)))
         self.place_var, self.job_var = tk.StringVar(), tk.StringVar()
-        self.delay_var = tk.StringVar(value="5")
-        Field(r1, self.place_var, "ID o enlace del juego", width=330).pack(side="left")
-        Btn(r1, "★ Favorito", self.add_fav, "ghost", padx=14, pady=9).pack(side="left", padx=(px(8), px(20)))
-        Field(r1, self.job_var, "Servidor privado / JobId (opcional)", width=290).pack(side="left")
-        lbl(r1, "Pausa", "muted", "sb").pack(side="left", padx=(px(20), px(8)))
-        Field(r1, self.delay_var, width=64, justify="center").pack(side="left")
-        lbl(r1, "s", "muted").pack(side="left", padx=(px(6), 0))
         st = self.m.store.settings()
         self.place_var.set(st.get("place", ""))
         self.job_var.set(st.get("job", ""))
-        delay = float(st.get("delay", 5))
-        self.delay_var.set(str(int(delay)) if delay == int(delay) else str(delay))
-        for v in (self.place_var, self.job_var, self.delay_var):
+        for v in (self.place_var, self.job_var):
             v.trace_add("write", self._settings_changed)
-
-        r2 = tk.Frame(fb, bg=C["panel"])
-        r2.pack(fill="x", padx=px(18), pady=(px(4), px(12)))
-        self.pick_lbl = lbl(r2, "", "muted")
-        self.pick_lbl.pack(side="left")
-        self.btn_go = Btn(r2, "Lanzar", self.go, "primary", padx=30, pady=11, font="b", min_w=170, radius=13)
+        self.btn_go = Btn(r1, "Lanzar", self.go, "primary", padx=30, pady=11, font="b", min_w=170, radius=13)
         self.btn_go.pack(side="right")
-        self.btn_closesel = Btn(r2, "Cerrar seleccionadas", self.close_selected, "ghost", pady=10)
+        self.btn_closesel = Btn(r1, "Cerrar seleccionadas", self.close_selected, "ghost", pady=10)
         self.btn_closesel.pack(side="right", padx=(0, px(8)))
-        self.btn_del = Btn(r2, "Eliminar", self.delete_selected, "danger", pady=10)
+        self.btn_del = Btn(r1, "Eliminar", self.delete_selected, "danger", pady=10)
         self.btn_del.pack(side="right", padx=(0, px(8)))
-        self.btn_clear = Btn(r2, "Quitar selección", self.clear_sel, "flat", pady=10)
-        self.btn_clear.pack(side="right", padx=(0, px(8)))
+        # el campo del servidor se empaqueta el último: si falta sitio se recorta él, no los botones
+        Field(r1, self.job_var, "Servidor privado / JobId (opcional)", width=290).pack(side="left")
 
         self.toast_cv = tk.Canvas(root, bg=C["bg"], highlightthickness=0, bd=0)
 
@@ -2795,9 +3098,8 @@ class App:
             lbl(box, "Añade una con su cookie, iniciando sesión en una ventana\no con un código rápido.", "muted",
                 bg=C["panel"], justify="center").pack(pady=(px(8), px(16)))
             Btn(box, "+ Añadir cuenta", self.open_add, "primary", padx=20, pady=9, font="b").pack()
-        busy = st["launching"]
         for idx, a in enumerate(accounts):
-            AccountRow(self, sf.inner, a, idx, a["id"] in self.sel, busy).pack(fill="x", pady=(0, px(8)), padx=(0, px(2)))
+            AccountRow(self, sf.inner, a, idx, a["id"] in self.sel).pack(fill="x", pady=(0, px(8)), padx=(0, px(2)))
         self.btn_selall.set_text("Ninguna" if accounts and len(self.sel) == len(accounts) else "Todas")
         self.btn_verify.set_enabled(bool(accounts))
         sf.inner.update_idletasks()
@@ -2814,17 +3116,14 @@ class App:
             self.anchor = idx
         self.acc_sig = None
         self.refresh()
+        self.m.prewarm(list(self.sel))
 
     def select_all(self):
         ids = {a["id"] for a in self.state["accounts"]}
         self.sel = set() if self.sel == ids else ids
         self.acc_sig = None
         self.refresh()
-
-    def clear_sel(self):
-        self.sel.clear()
-        self.acc_sig = None
-        self.refresh()
+        self.m.prewarm(list(self.sel))
 
     def rename(self, aid, current):
         name = self.ask_text("Cambiar nombre", "Nombre de la cuenta", current)
@@ -2896,20 +3195,11 @@ class App:
     def update_footer(self):
         st = self.state
         n, busy = len(self.sel), st["launching"]
-        self.btn_go.set_text("Detener" if busy else ("Lanzar %d cuentas" % n if n > 1 else "Lanzar"))
+        self.btn_go.set_text("Detener" if busy else ("Lanzar instancias seleccionadas" if n > 1 else "Lanzar"))
         self.btn_go.set_kind("danger" if busy else "primary")
         self.btn_go.set_enabled(busy or n > 0)
         self.btn_closesel.set_enabled(not busy and any(a["tag"] == "ok" and a["id"] in self.sel for a in st["accounts"]))
         self.btn_del.set_enabled(not busy and n > 0)
-        self.btn_clear.set_enabled(n > 0)
-        game = "Juego: %s   ·   " % short(self.sel_game["name"], 30) if self.sel_game else ""
-        if busy:
-            self.pick_lbl.configure(text="Lanzando cuentas…", fg=C["warn"])
-        elif n:
-            self.pick_lbl.configure(text="%s%d cuenta%s seleccionada%s" % (
-                game, n, "" if n == 1 else "s", "" if n == 1 else "s"), fg=C["ink"])
-        else:
-            self.pick_lbl.configure(text=game + "Selecciona cuentas y pulsa Lanzar.", fg=C["muted"])
 
     def go(self):
         if self.state and self.state["launching"]:
@@ -2919,8 +3209,11 @@ class App:
         self.do_launch(list(self.sel))
 
     def do_launch(self, ids):
+        """Abre todas las cuentas a la vez: sin pausas entre ellas ni esperar a cada una."""
         try:
-            r = self.m.launch(ids, self.place_var.get(), self.job_var.get(), self.delay_var.get().strip() or "0")
+            r = self.m.launch(ids, self.place_var.get(), self.job_var.get(), 0, parallel=True)
+            if r["started"] > 1 and not r["skipped"]:
+                self.toast("Abriendo %d cuentas a la vez…" % r["started"])
             if r["skipped"]:
                 self.toast("%d cuenta%s ya estaba%s abierta%s y no se ha tocado." % (
                     r["skipped"], "" if r["skipped"] == 1 else "s", "" if r["skipped"] == 1 else "n",
@@ -2958,8 +3251,7 @@ class App:
 
     def _save_settings(self):
         try:
-            self.m.update_settings({"place": self.place_var.get(), "job": self.job_var.get(),
-                                    "delay": self.delay_var.get().strip() or "0"})
+            self.m.update_settings({"place": self.place_var.get(), "job": self.job_var.get()})
         except ValueError:
             pass
 
@@ -3131,22 +3423,6 @@ class App:
             card.set_selected(bool(place and card.g["place_id"] == place))
         if self.state:
             self.update_footer()
-
-    def add_fav(self):
-        place = parse_place(self.place_var.get())
-        if place is None:
-            self.toast("Elige primero un juego (o pega su ID o enlace).", True)
-            return
-        name = self.sel_game["name"] if self.sel_game else self.ask_text("Favorito", "Ponle un nombre al juego", "")
-        if name is None:
-            return
-        try:
-            game = self.sel_game if self.sel_game and self.sel_game.get("place_id") == place else None
-            self.m.add_place(name, str(place), game)
-            self.toast("Guardado en favoritos.")
-        except ValueError as err:
-            self.toast(str(err), True)
-        self.refresh()
 
     def toggle_game_fav(self, g):
         if any(p["place_id"] == g["place_id"] for p in self.m.store.places()):

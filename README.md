@@ -10,6 +10,7 @@ a la vez en varias instancias del cliente. Aplicación de escritorio (Tkinter), 
 ## Qué hace
 
 - **Varias cuentas, varias instancias:** lanza el mismo juego con varias cuentas a la vez (multi-instancia).
+- **Lanzar a la vez:** selecciona una o varias cuentas y pulsa «Lanzar»: todas se abren de golpe, sin pausas ni esperas entre ellas.
 - **Tres formas de añadir cuentas:**
   - **Cookie** `.ROBLOSECURITY` (también acepta líneas `usuario:contraseña:cookie` y archivos `.txt`).
   - **Navegador:** abre una ventana limpia de Edge/Chrome, inicias sesión (con captcha y 2FA) y la cuenta se añade sola.
