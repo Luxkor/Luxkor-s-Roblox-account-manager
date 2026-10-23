@@ -44,6 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import OrderedDict
 
 try:
     import tkinter as tk
@@ -58,7 +59,7 @@ except ImportError:  # pragma: no cover
 
 APP_NAME = "RobloxManager"
 APP_TITLE = "Luxkor's Account Manager"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 IS_WINDOWS = os.name == "nt"
 PLAYER_EXE = "RobloxPlayerBeta.exe"
 MUTEX_NAME = "ROBLOX_singletonMutex"
@@ -351,12 +352,22 @@ class Store:
             return True
 
     def update_account(self, account_id: str, **fields):
+        self.update_accounts({account_id: fields})
+
+    def update_accounts(self, updates: dict) -> int:
+        """Actualiza varias cuentas con una sola escritura atómica del archivo."""
+        if not updates:
+            return 0
         with self.lock:
+            changed = 0
             for a in self.data["accounts"]:
-                if a["id"] == account_id:
+                fields = updates.get(a["id"])
+                if fields:
                     a.update(fields)
-                    self._save()
-                    return
+                    changed += 1
+            if changed:
+                self._save()
+            return changed
 
     def delete_accounts(self, ids):
         with self.lock:
@@ -998,8 +1009,8 @@ def process_cmdline(pid: int):
         k32.CloseHandle(handle)
 
 
-def toolhelp_pids(exe_name: str):
-    """PIDs de los procesos con ese nombre, con la instantánea de procesos de Windows (~1 ms, sin lanzar nada)."""
+def toolhelp_processes(exe_names=None):
+    """Instantánea de PIDs por nombre de ejecutable, sin lanzar procesos externos."""
     import ctypes
     from ctypes import wintypes
 
@@ -1020,18 +1031,29 @@ def toolhelp_pids(exe_name: str):
     snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
     if snap in (None, ctypes.c_void_p(-1).value):
         raise OSError("No se pudo leer la lista de procesos")
-    pids, want = [], exe_name.lower()
+    if isinstance(exe_names, str):
+        exe_names = (exe_names,)
+    wanted = {name.lower() for name in exe_names} if exe_names else None
+    processes = {}
     try:
         entry = PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
         ok = k32.Process32FirstW(snap, ctypes.byref(entry))
         while ok:
-            if entry.szExeFile.lower() == want:
-                pids.append(int(entry.th32ProcessID))
+            name = entry.szExeFile.lower()
+            if wanted is None or name in wanted:
+                processes.setdefault(name, []).append(int(entry.th32ProcessID))
             ok = k32.Process32NextW(snap, ctypes.byref(entry))
     finally:
         k32.CloseHandle(snap)
-    return sorted(pids)
+    for pids in processes.values():
+        pids.sort()
+    return processes
+
+
+def toolhelp_pids(exe_name: str):
+    """PIDs de un ejecutable según una instantánea rápida de procesos de Windows."""
+    return toolhelp_processes((exe_name,)).get(exe_name.lower(), [])
 
 
 def _sys32(name: str) -> str:
@@ -1040,6 +1062,8 @@ def _sys32(name: str) -> str:
 
 
 class WindowsPlatform:
+    UPDATER_EXES = ("RobloxPlayerInstaller.exe", "RobloxPlayerLauncher.exe")
+
     def __init__(self, mutex_name=MUTEX_NAME, event_name=EVENT_NAME):
         self._mutex = self._event_guard = None
         self.mutex_name, self.event_name = mutex_name, event_name
@@ -1060,6 +1084,72 @@ class WindowsPlatform:
         except (OSError, subprocess.SubprocessError):
             return []
         return parse_tasklist(out.stdout.decode("utf-8", "replace"))
+
+    def process_snapshot(self):
+        return toolhelp_processes((PLAYER_EXE,) + self.UPDATER_EXES)
+
+    def updater_pids(self, snapshot=None):
+        try:
+            snapshot = snapshot if snapshot is not None else self.process_snapshot()
+            return sorted({pid for name in self.UPDATER_EXES for pid in snapshot.get(name.lower(), ())})
+        except Exception:  # noqa: BLE001
+            return []
+
+    @staticmethod
+    def player_version():
+        """Versión instalada que usa el protocolo roblox-player, si Windows la publica."""
+        if not IS_WINDOWS:
+            return None
+        try:
+            import winreg
+
+            key_path = r"Software\Classes\roblox-player\shell\open\command"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                command = winreg.QueryValueEx(key, None)[0]
+            match = re.match(r'^\s*(?:"([^"]+)"|(.*?RobloxPlayerBeta\.exe))', command, re.IGNORECASE)
+            executable = (match.group(1) or match.group(2)) if match else ""
+            if os.path.basename(executable).lower() != PLAYER_EXE.lower():
+                return None
+            return os.path.basename(os.path.dirname(executable))
+        except (OSError, ImportError, TypeError):
+            return None
+
+    def show_update_window(self, pids=None):
+        """Trae al frente una ventana del actualizador que Roblox ya haya iniciado."""
+        pids = set(pids or self.updater_pids())
+        if not pids or not IS_WINDOWS:
+            return False
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [enum_proc, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindowAsync.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.FlashWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
+        user32.FlashWindow.restype = wintypes.BOOL
+        found_windows = []
+
+        def visit(hwnd, _lparam):
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in pids:
+                user32.ShowWindowAsync(hwnd, 9)  # SW_RESTORE
+                foreground = bool(user32.SetForegroundWindow(hwnd))
+                if not foreground:
+                    user32.FlashWindow(hwnd, True)
+                found_windows.append(True)
+                return False
+            return True
+
+        user32.EnumWindows(enum_proc(visit), 0)
+        return bool(found_windows)
 
     def cmdline(self, pid: int):
         try:
@@ -1178,6 +1268,14 @@ class Manager:
         self.multi_detail = ""
         self.cancel = threading.Event()
         self.worker = None
+        self._launch_started = {}
+        self._launch_version = {}
+        self._update_notice_id = 0
+        self._update_notice = None
+        self._update_notice_signature = None
+        self._last_update_raise_at = 0.0
+        self._shown_updater_pids = set()
+        self._update_lock = threading.Lock()
         self._warm = {}
         self.login = None
         self.session_id = str(uuid.uuid4())
@@ -1217,9 +1315,9 @@ class Manager:
             if not need:
                 return
             urls = self.api.avatars([a["user_id"] for a in need])
-            for a in need:
-                if urls.get(a["user_id"]):
-                    self.store.update_account(a["id"], avatar=urls[a["user_id"]], avatar_ts=int(now))
+            updates = {a["id"]: {"avatar": urls[a["user_id"]], "avatar_ts": int(now)}
+                       for a in need if urls.get(a["user_id"])}
+            self.store.update_accounts(updates)
         except (RobloxError, OSError, ValueError) as err:
             log.info("No se pudieron actualizar los avatares: %s", err)
 
@@ -1228,8 +1326,87 @@ class Manager:
         with self.lock:
             self.status[account_id] = {"text": text, "tag": tag}
 
+    def _process_snapshot(self):
+        snapshot = getattr(self.plat, "process_snapshot", None)
+        if snapshot:
+            try:
+                return snapshot()
+            except Exception:  # noqa: BLE001
+                log.debug("No se pudo leer la instantánea de procesos", exc_info=True)
+        try:
+            return {PLAYER_EXE.lower(): self.plat.list_pids()}
+        except Exception:  # noqa: BLE001
+            return {PLAYER_EXE.lower(): []}
+
+    def _player_version(self):
+        getter = getattr(self.plat, "player_version", None)
+        try:
+            return getter() if getter else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _notify_update(self, signature, message):
+        with self.lock:
+            if signature == self._update_notice_signature:
+                return
+            self._update_notice_signature = signature
+            self._update_notice_id += 1
+            self._update_notice = {"id": self._update_notice_id, "text": message}
+
+    def _observe_update(self, snapshot, baseline_version=None):
+        get_updaters = getattr(self.plat, "updater_pids", None)
+        try:
+            updater_pids = get_updaters(snapshot) if get_updaters else []
+        except Exception:  # noqa: BLE001
+            updater_pids = []
+        if updater_pids:
+            now = time.monotonic()
+            active_pids = set(updater_pids)
+            with self._update_lock:
+                self._shown_updater_pids.intersection_update(active_pids)
+                pending_pids = active_pids - self._shown_updater_pids
+                if pending_pids and now - self._last_update_raise_at >= 1.0:
+                    self._last_update_raise_at = now
+                    show = getattr(self.plat, "show_update_window", None)
+                    if show:
+                        try:
+                            if show(sorted(pending_pids)):
+                                self._shown_updater_pids.update(pending_pids)
+                        except Exception:  # noqa: BLE001
+                            log.debug("No se pudo mostrar la ventana del actualizador de Roblox", exc_info=True)
+                raised = bool(active_pids & self._shown_updater_pids)
+            suffix = " La ventana del actualizador de Roblox está abierta." if raised else ""
+            self._notify_update(("updating", tuple(sorted(active_pids)), raised),
+                                "Roblox está aplicando una actualización. Espera a que termine y vuelve a pulsar «Lanzar»."
+                                + suffix)
+            return "updating"
+
+        if not baseline_version:
+            return None
+        current_version = self._player_version()
+        if current_version and current_version != baseline_version:
+            self._notify_update(("updated", current_version),
+                                "Roblox se actualizó y cerró una instancia durante el inicio. "
+                                "Vuelve a pulsar «Lanzar» para abrirla de nuevo.")
+            return "updated"
+        return None
+
     def refresh_pids(self):
-        pids = self.plat.list_pids()
+        snapshot = self._process_snapshot()
+        pids = snapshot.get(PLAYER_EXE.lower(), [])
+        now = time.monotonic()
+        with self.lock:
+            recent = {aid: version for aid, started in self._launch_started.items()
+                      if now - started <= 90 for version in (self._launch_version.get(aid),)}
+        update_state = self._observe_update(snapshot) if recent else None
+        current_version = self._player_version() if recent and update_state != "updating" else None
+        updated_launches = {aid for aid, version in recent.items()
+                            if version and current_version and version != current_version}
+        if update_state != "updating" and updated_launches:
+            self._notify_update(("updated", current_version),
+                                "Roblox se actualizó y cerró una instancia durante el inicio. "
+                                "Vuelve a pulsar «Lanzar» para abrirla de nuevo.")
+            update_state = "updated"
         with self.lock:
             self.known_pids = pids
             alive = set(pids)
@@ -1237,7 +1414,20 @@ class Manager:
                 if pid not in alive:
                     del self.pids[aid]
                     if self.status.get(aid, {}).get("tag") == "ok":
-                        self.status[aid] = {"text": "Cerrada", "tag": "idle"}
+                        if aid in recent and update_state == "updating":
+                            self.status[aid] = {"text": "Actualización de Roblox", "tag": "warn"}
+                        elif aid in updated_launches:
+                            self.status[aid] = {"text": "Roblox actualizado; relanza", "tag": "warn"}
+                        else:
+                            self.status[aid] = {"text": "Cerrada", "tag": "idle"}
+            if update_state == "updated":
+                for aid in updated_launches:
+                    if aid not in self.pids and self.status.get(aid, {}).get("tag") == "warn":
+                        self.status[aid] = {"text": "Roblox actualizado; relanza", "tag": "warn"}
+            expired = [aid for aid, started in self._launch_started.items() if now - started > 90]
+            for aid in expired:
+                self._launch_started.pop(aid, None)
+                self._launch_version.pop(aid, None)
 
     def state(self) -> dict:
         with self.lock:
@@ -1258,6 +1448,7 @@ class Manager:
                 "roblox_count": len(self.known_pids),
                 "launching": self.launching(),
                 "platform": "windows" if IS_WINDOWS else "other",
+                "update_notice": dict(self._update_notice) if self._update_notice else None,
             }
 
     # -- cuentas
@@ -1304,6 +1495,8 @@ class Manager:
             for i in ids:
                 self.status.pop(i, None)
                 self.pids.pop(i, None)
+                self._launch_started.pop(i, None)
+                self._launch_version.pop(i, None)
         return {"revoked": revoked, "failed": failed}
 
     def verify(self, ids):
@@ -1593,6 +1786,15 @@ class Manager:
         ids = [i for i in dict.fromkeys(ids) if self.store.get(i)]
         if not ids:
             raise ValueError("Selecciona al menos una cuenta.")
+        snapshot = self._process_snapshot()
+        get_updaters = getattr(self.plat, "updater_pids", None)
+        try:
+            updater_pids = get_updaters(snapshot) if get_updaters else []
+        except Exception:  # noqa: BLE001
+            updater_pids = []
+        if updater_pids:
+            self._observe_update(snapshot)
+            raise ValueError("Roblox está aplicando una actualización. Espera a que termine.")
         with self.lock:
             if self.launching():
                 raise ValueError("Ya hay un lanzamiento en curso. Espera a que termine o cancélalo.")
@@ -1646,15 +1848,23 @@ class Manager:
             ticket = self.api.auth_ticket(self.store.cookie(aid), place)
             before = set(self.plat.list_pids())
             self.set_status(aid, "Abriendo Roblox…", "busy")
+            version_before = self._player_version()
+            launch_started = time.monotonic()
             self.plat.launch(build_launch_uri(ticket, place, job))
             self.store.update_account(aid, last_launch=int(time.time()))
             pid = self._wait_new_pid(before, 15)
             with self.lock:
+                self._launch_started[aid] = launch_started
+                self._launch_version[aid] = version_before
                 if pid:
                     self.pids[aid] = pid
                     self.status[aid] = {"text": "Abierta", "tag": "ok"}
                 else:
                     self.status[aid] = {"text": "Lanzada, sin confirmar", "tag": "warn"}
+            update_state = self._observe_update(self._process_snapshot(), version_before)
+            if not pid and update_state:
+                self.set_status(aid, "Actualización de Roblox" if update_state == "updating"
+                                else "Roblox actualizado; relanza", "warn")
         except AuthExpired:
             self.set_status(aid, "Cookie caducada", "bad")
         except (RobloxError, SecretError, OSError, ValueError) as err:
@@ -1695,7 +1905,9 @@ class Manager:
             for aid in ids:
                 self.set_status(aid, "Pidiendo acceso…", "busy")
             before = set(self.plat.list_pids())  # procesos que ya había, antes de abrir nada
+            version_before = self._player_version()
             launched, lock = [], threading.Lock()  # (cuenta, trackerId): el trackerId viaja en la línea de comandos
+            launch_times, launch_dates = {}, {}
 
             def one(aid):
                 try:
@@ -1714,32 +1926,41 @@ class Manager:
                 self.set_status(aid, "Abriendo Roblox…", "busy")
                 with lock:  # lanzar y anotar van juntos: el orden anotado es el orden real de las ventanas
                     try:
+                        launch_times[aid] = time.monotonic()
                         self.plat.launch(build_launch_uri(ticket, place, job, tracker))
                     except (RobloxError, OSError) as err:
+                        launch_times.pop(aid, None)
                         log.warning("Fallo lanzando %s: %s", aid, err)
                         self.set_status(aid, "Error: %s" % err, "bad")
                         return
+                    launch_dates[aid] = int(time.time())
                     launched.append((aid, tracker))
-                self.store.update_account(aid, last_launch=int(time.time()))
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(ids), 8))) as pool:
                 list(pool.map(one, ids))
-            self._assign_pids(launched, before)
+            self.store.update_accounts({aid: {"last_launch": stamp} for aid, stamp in launch_dates.items()})
+            self._assign_pids(launched, before, version_before, launch_times)
         except Exception:  # noqa: BLE001
             log.exception("Fallo inesperado en el lanzamiento a la vez")
             for aid in ids:
                 if self.status.get(aid, {}).get("tag") == "busy":
                     self.set_status(aid, "Error inesperado (mira app.log)", "bad")
 
-    def _assign_pids(self, launched, before):
+    def _assign_pids(self, launched, before, version_before=None, launch_times=None):
         """Relaciona cada cuenta con su proceso de Roblox.
         Exacto si Windows deja leer la línea de comandos (lleva el trackerId); si no, por orden de aparición."""
         if not launched:
             return
+        launch_times = launch_times or {}
         found, deadline = {}, time.time() + self.PID_WAIT
         new = []
+        update_state = None
         while True:
-            new = sorted(p for p in self.plat.list_pids() if p not in before)
+            snapshot = self._process_snapshot()
+            new = sorted(p for p in snapshot.get(PLAYER_EXE.lower(), []) if p not in before)
+            observed = self._observe_update(snapshot, version_before)
+            if observed:
+                update_state = observed
             taken = set(found.values())
             for pid in new:
                 if pid in taken:
@@ -1753,17 +1974,27 @@ class Manager:
                     or self.cancel.is_set():
                 break
             self.cancel.wait(0.2)
+        observed = self._observe_update(self._process_snapshot(), version_before)
+        if observed:
+            update_state = observed
         left_accounts = [aid for aid, _t in launched if aid not in found]
         left_pids = [p for p in new if p not in found.values()]
         if left_accounts and len(left_accounts) == len(left_pids):  # sin línea de comandos: por orden de aparición
             found.update(zip(left_accounts, left_pids))
         with self.lock:
             for aid, _t in launched:
+                self._launch_started[aid] = launch_times.get(aid, time.monotonic())
+                self._launch_version[aid] = version_before
                 if aid in found:
                     self.pids[aid] = found[aid]
                     self.status[aid] = {"text": "Abierta", "tag": "ok"}
                 else:
-                    self.status[aid] = {"text": "Lanzada, sin confirmar", "tag": "warn"}
+                    if update_state == "updating":
+                        self.status[aid] = {"text": "Actualización de Roblox", "tag": "warn"}
+                    elif update_state == "updated":
+                        self.status[aid] = {"text": "Roblox actualizado; relanza", "tag": "warn"}
+                    else:
+                        self.status[aid] = {"text": "Lanzada, sin confirmar", "tag": "warn"}
 
     def _wait_new_pid(self, before, timeout):
         deadline = time.time() + timeout
@@ -1841,6 +2072,7 @@ FONTS = {}
 SCALE = 1.0
 IMG_OK = roblox_img_ok  # las pruebas pueden cambiarlo
 _PHOTOS = {}
+IMAGE_CACHE_LIMIT = 192
 
 
 def asset_path(name: str) -> str:
@@ -2289,8 +2521,8 @@ class AccountRow(tk.Canvas):
         self.bgc = C["selected"] if sel else C["card"]
         super().__init__(parent, bg=C["panel"], height=px(self.H), highlightthickness=0, bd=0, cursor="hand2")
         self.b_edit = Btn(self, "✎", lambda: app.rename(a["id"], a["alias"]), "ghost", padx=10, pady=6, font="s", bg=self.bgc)
-        self._bg_outer = self._make_round_layer("background", C["line"])
-        self._bg_inner = self._make_round_layer("background", self.bgc)
+        self._bg_outer = _rounded_canvas_items(self, "background", C["line"])
+        self._bg_inner = _rounded_canvas_items(self, "background", self.bgc)
         self._job, self._width, self._keep = None, 0, []
         self._rendered = False
         self.bind("<Configure>", self._on_size)
@@ -2308,21 +2540,6 @@ class AccountRow(tk.Canvas):
                 self.after_cancel(self._job)
             self._job = self.after(16, self.render)
 
-    def _make_round_layer(self, tag, fill):
-        items = [self.create_rectangle(0, 0, 1, 1, fill=fill, outline="", tags=(tag,)) for _ in range(2)]
-        items.extend(self.create_oval(0, 0, 1, 1, fill=fill, outline="", tags=(tag,)) for _ in range(4))
-        return items
-
-    def _draw_round_layer(self, items, x, y, w, h, radius, fill):
-        r = min(radius, max(1, h // 2), max(1, w // 2))
-        coords = ((x + r, y, x + w - r, y + h), (x, y + r, x + w, y + h - r),
-                  (x, y, x + 2 * r, y + 2 * r), (x + w - 2 * r, y, x + w, y + 2 * r),
-                  (x, y + h - 2 * r, x + 2 * r, y + h),
-                  (x + w - 2 * r, y + h - 2 * r, x + w, y + h))
-        for item, box in zip(items, coords):
-            self.coords(item, *box)
-            self.itemconfigure(item, fill=fill, outline="")
-
     def render(self):
         w, h, a = self._width, px(self.H), self.a
         if w < 120:
@@ -2332,10 +2549,10 @@ class AccountRow(tk.Canvas):
         self._keep = []
         pad = px(16)
         border = C["accent"] if self.sel else C["line"]
-        self._draw_round_layer(self._bg_outer, 0, 0, w, h, px(16), border)
+        _draw_rounded_canvas_layer(self, self._bg_outer, 0, 0, w, h, px(16), border)
         inset = px(1)
-        self._draw_round_layer(self._bg_inner, inset, inset, w - 2 * inset, h - 2 * inset,
-                               max(1, px(16) - inset), self.bgc)
+        _draw_rounded_canvas_layer(self, self._bg_inner, inset, inset, w - 2 * inset, h - 2 * inset,
+                                   max(1, px(16) - inset), self.bgc)
         n = px(22)
         self._check_item = self.create_image(pad, h // 2,
                                              image=photo(("chk", self.sel, n), lambda: check_image(self.sel, n)),
@@ -2351,7 +2568,7 @@ class AccountRow(tk.Canvas):
                                             tags=("content",))
         self._user_item = self.create_text(0, h * 0.68, anchor="w", fill=C["muted"], font=FONTS["s"],
                                            tags=("content",))
-        self._badge_items = self._make_round_layer("content", C["line"])
+        self._badge_items = _rounded_canvas_items(self, "content", C["line"])
         self._status_item = self.create_text(0, h * 0.68, anchor="center", font=FONTS["sb"], tags=("content",))
         self._rendered = True
         self._resize_content()
@@ -2360,10 +2577,11 @@ class AccountRow(tk.Canvas):
         w, h, a = self._width, px(self.H), self.a
         if w < 120:
             return
-        self._draw_round_layer(self._bg_outer, 0, 0, w, h, px(16), C["accent"] if self.sel else C["line"])
+        _draw_rounded_canvas_layer(self, self._bg_outer, 0, 0, w, h, px(16),
+                                   C["accent"] if self.sel else C["line"])
         inset = px(1)
-        self._draw_round_layer(self._bg_inner, inset, inset, w - 2 * inset, h - 2 * inset,
-                               max(1, px(16) - inset), self.bgc)
+        _draw_rounded_canvas_layer(self, self._bg_inner, inset, inset, w - 2 * inset, h - 2 * inset,
+                                   max(1, px(16) - inset), self.bgc)
         pad, n, size = px(16), px(22), px(44)
         tx = pad + n + px(14) + size + 2 * ring_pad(size) + px(14)
         ex = w - pad
@@ -2382,7 +2600,7 @@ class AccountRow(tk.Canvas):
         self.itemconfigure(self._user_item, text=user)
         user_box = self.bbox(self._user_item)
         bx = (user_box[2] if user_box else tx) + px(10)
-        self._draw_round_layer(self._badge_items, bx, h * 0.68 - bh / 2, bw, bh, bh / 2, bgb)
+        _draw_rounded_canvas_layer(self, self._badge_items, bx, h * 0.68 - bh / 2, bw, bh, bh / 2, bgb)
         self.coords(self._status_item, bx + bw / 2, h * 0.68)
         self.itemconfigure(self._status_item, text=text, fill=fg)
 
@@ -2397,7 +2615,7 @@ class AccountRow(tk.Canvas):
 class GameCard(tk.Canvas):
     W, H = 150, 206
 
-    def __init__(self, app, parent, g, selected, fav):
+    def __init__(self, app, parent, g, selected, fav, favorite_ids=None):
         super().__init__(parent, width=px(self.W), height=px(self.H), bg=C["panel"], highlightthickness=0, bd=0,
                          cursor="hand2")
         self.app, self.g, self.selected, self.hover = app, g, selected, False
@@ -2406,7 +2624,9 @@ class GameCard(tk.Canvas):
         size = w - 2 * pad
         icon = self.create_image(pad, pad, anchor="nw")
         app.set_image(g.get("icon"), "game", size, g["name"], lambda ph: self._apply(icon, ph))
-        is_favorite = any(p["place_id"] == g["place_id"] for p in app.m.store.places())
+        if favorite_ids is None:
+            favorite_ids = {p["place_id"] for p in app.m.store.places()}
+        is_favorite = g["place_id"] in favorite_ids
         self._star_item = self.create_image(w - pad, pad, image=app.star_image(px(24), is_favorite), anchor="ne")
         self.tag_bind(self._star_item, "<Button-1>", self._toggle_favorite)
         lines = fit_lines(g["name"], FONTS["sb"], w - 2 * px(12), 2)
@@ -2647,11 +2867,15 @@ class App:
         for key, size, weight in (("n", 10, "normal"), ("b", 10, "bold"), ("s", 9, "normal"), ("sb", 9, "bold"),
                                   ("h", 17, "bold"), ("t", 13, "bold")):
             FONTS[key] = tkfont.Font(root=root, family="Segoe UI", size=size, weight=weight)
-        self.icons = [ImageTk.PhotoImage(draw_logo(n)) for n in (256, 64, 32)]
+        self._logo_source = draw_logo(256)
+        self.icons = [ImageTk.PhotoImage(self._logo_source if n == 256 else
+                                         self._logo_source.resize((n, n), Image.Resampling.LANCZOS))
+                      for n in (256, 64, 32)]
         root.iconphoto(True, *self.icons)
         self.q = queue.Queue()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=6)
-        self.photos, self.sel, self.anchor = {}, set(), None
+        self.photos, self._pending_photos = OrderedDict(), {}
+        self.sel, self.anchor = set(), None
         self.star_photos = {}
         root.report_callback_exception = self._report_callback_exception
         self.state, self.acc_sig, self.places_sig = None, None, None
@@ -2659,6 +2883,7 @@ class App:
         self.game_cards, self.sel_game, self.add_dialog = [], None, None
         self._fav_icon_loading = False
         self.toast_job = self.save_job = self.search_job = self.layout_job = None
+        self._suppress_search = False
         self.fav_confirm = None
         self._build_style()
         self._build()
@@ -2672,6 +2897,7 @@ class App:
             root.after(35, lambda: root.attributes("-alpha", 1.0) if root.winfo_exists() else None)
         self._pump()
         self.bg(self.m.game_sorts, self._sorts_done)
+        self._seen_update_notice = 0
 
     def _report_callback_exception(self, exc, value, tb):
         log.error("Excepción en evento de interfaz", exc_info=(exc, value, tb))
@@ -2876,7 +3102,7 @@ class App:
         except tk.TclError:
             pass
 
-    def toast(self, text, bad=False):
+    def toast(self, text, bad=False, duration=None):
         if self.toast_job:
             try:
                 self.root.after_cancel(self.toast_job)
@@ -2895,7 +3121,8 @@ class App:
         cv.create_image(0, 0, image=self._toast_img, anchor="nw")
         cv.tag_raise(t)
         cv.place(relx=0.5, rely=1.0, y=-px(168), anchor="s")
-        self.toast_job = self.root.after(8000 if bad else 3000, self._hide_toast)
+        self.toast_job = self.root.after(duration if duration is not None else (8000 if bad else 3000),
+                                         self._hide_toast)
         # Canvas.tkraise() eleva elementos del dibujo; esta orden Tcl eleva el widget.
         cv.tk.call("raise", cv._w)
     def _wheel(self, e):
@@ -2907,29 +3134,48 @@ class App:
             w = getattr(w, "master", None)
 
     # -- imágenes
+    def _cache_photo(self, key, image):
+        self.photos[key] = image
+        self.photos.move_to_end(key)
+        while len(self.photos) > IMAGE_CACHE_LIMIT:
+            self.photos.popitem(last=False)
+
     def set_image(self, url, kind, size, letter, apply, ring=None):
         circle = kind == "avatar"
         key = (url, kind, size, ring)
         cached = self.photos.get(key)
         if cached is not None:
+            self.photos.move_to_end(key)
             apply(cached)
             return
         phk = ("ph", letter, kind, size, ring)
         if phk not in self.photos:
-            self.photos[phk] = ImageTk.PhotoImage(placeholder_image(letter, size, circle, ring))
+            self._cache_photo(phk, ImageTk.PhotoImage(placeholder_image(letter, size, circle, ring)))
+        else:
+            self.photos.move_to_end(phk)
         apply(self.photos[phk])
         if not url:
             return
+        if key in self._pending_photos:
+            self._pending_photos[key].append(apply)
+            return
+        self._pending_photos[key] = [apply]
 
         def done(img, err):
+            callbacks = self._pending_photos.pop(key, [])
             if err or img is None:
                 return
-            ph = self.photos.get(key) or ImageTk.PhotoImage(img)
-            self.photos[key] = ph
-            try:
-                apply(ph)
-            except tk.TclError:
-                pass
+            ph = self.photos.get(key)
+            if ph is None:
+                ph = ImageTk.PhotoImage(img)
+                self._cache_photo(key, ph)
+            else:
+                self.photos.move_to_end(key)
+            for callback in callbacks:
+                try:
+                    callback(ph)
+                except tk.TclError:
+                    pass
 
         def run():
             try:
@@ -2948,7 +3194,8 @@ class App:
 
         head = tk.Frame(root, bg=C["bg"])
         head.grid(row=0, column=0, sticky="ew", padx=pad, pady=(px(14), px(12)))
-        self._logo = ImageTk.PhotoImage(draw_logo(px(48)))
+        logo_size = px(48)
+        self._logo = ImageTk.PhotoImage(self._logo_source.resize((logo_size, logo_size), Image.Resampling.LANCZOS))
         tk.Label(head, bg=C["bg"], image=self._logo).pack(side="left")
         titles = tk.Frame(head, bg=C["bg"])
         titles.pack(side="left", padx=(px(14), 0))
@@ -3049,6 +3296,10 @@ class App:
 
     def apply_state(self, st):
         self.state = st
+        update_notice = st.get("update_notice")
+        if update_notice and update_notice["id"] != getattr(self, "_seen_update_notice", 0):
+            self._seen_update_notice = update_notice["id"]
+            self.toast(update_notice["text"], duration=8000)
         ids = {a["id"] for a in st["accounts"]}
         self.sel &= ids
         multi = st["multi"]
@@ -3164,7 +3415,8 @@ class App:
         try:
             self.m.verify(list(self.sel))
         except ValueError as err:
-            self.toast(str(err), True)
+            if "actualización de roblox" not in str(err).lower():
+                self.toast(str(err), True)
         self.refresh()
 
     def clear_cookie_clipboard(self):
@@ -3272,20 +3524,12 @@ class App:
 
     def on_category(self, cat_id):
         self.cat_id = cat_id
-        if self.search_job:
-            try:
-                self.root.after_cancel(self.search_job)
-            except tk.TclError:
-                pass
-            self.search_job = None
-        self.search_var.set("")
-        # The trace schedules an empty search; category loading below replaces it.
-        if self.search_job:
-            try:
-                self.root.after_cancel(self.search_job)
-            except tk.TclError:
-                pass
-            self.search_job = None
+        self._cancel_search()
+        self._suppress_search = True
+        try:
+            self.search_var.set("")
+        finally:
+            self._suppress_search = False
         self.load_category()
 
     def load_category(self):
@@ -3294,21 +3538,22 @@ class App:
         elif self.cat_id:
             self.request_games(self.m.games_list, self.cat_id)
 
-    def on_search_typed(self):
+    def _cancel_search(self):
         if self.search_job:
             try:
                 self.root.after_cancel(self.search_job)
             except tk.TclError:
                 pass
+            self.search_job = None
+
+    def on_search_typed(self):
+        if self._suppress_search:
+            return
+        self._cancel_search()
         self.search_job = self.root.after(300, self.run_search)
 
     def _search_enter(self, _event=None):
-        if self.search_job:
-            try:
-                self.root.after_cancel(self.search_job)
-            except tk.TclError:
-                pass
-        self.search_job = None
+        self._cancel_search()
         self.run_search()
         return "break"
 
@@ -3381,8 +3626,10 @@ class App:
     def render_games(self, games, fav=False):
         self.clear_cards()
         place = parse_place(self.place_var.get())
+        favorite_ids = {p["place_id"] for p in self.m.store.places()}
         for g in games:
-            self.game_cards.append(GameCard(self, self.games_sf.inner, g, bool(place and g["place_id"] == place), fav))
+            selected = bool(place and g["place_id"] == place)
+            self.game_cards.append(GameCard(self, self.games_sf.inner, g, selected, fav, favorite_ids))
         self.layout_games(force=True)
         self.games_sf.canvas.yview_moveto(0)
 
