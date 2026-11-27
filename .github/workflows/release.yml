@@ -23,7 +23,7 @@ jobs:
       - name: Pruebas
         run: python -m unittest discover -s tests
       - name: Compilar
-        run: pyinstaller --onefile --noconsole --clean --exclude-module numpy --add-data "assets/star.png;assets" --icon assets/icon.ico --name LuxkorAccountManager roblox_manager.py
+        run: pyinstaller --onefile --noconsole --clean --exclude-module numpy --add-data "assets/star.png;assets" --add-data "assets/logo.png;assets" --icon assets/icon.ico --name LuxkorAccountManager roblox_manager.py
       - name: SHA-256
         shell: pwsh
         run: |

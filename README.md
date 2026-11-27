@@ -49,10 +49,10 @@ Instala las dependencias de compilación y ejecuta:
 
 ```powershell
 pip install -r requirements.txt -r requirements-dev.txt
-pyinstaller --onefile --noconsole --clean --exclude-module numpy --add-data "assets/star.png;assets" --icon assets/icon.ico --name LuxkorAccountManager roblox_manager.py
+pyinstaller --onefile --noconsole --clean --exclude-module numpy --add-data "assets/star.png;assets" --add-data "assets/logo.png;assets" --icon assets/icon.ico --name LuxkorAccountManager roblox_manager.py
 ```
 
-El resultado queda en `dist/LuxkorAccountManager.exe`. Los datos del usuario se guardan en `%APPDATA%\RobloxManager`, no junto al `.exe`.
+El resultado queda en `dist/LuxkorAccountManager.exe`. Los datos del usuario se guardan en `%APPDATA%\RobloxManager`, no junto al `.exe` (la subcarpeta `img` es solo una caché de avatares e iconos y se puede borrar).
 
 ## Seguridad
 
