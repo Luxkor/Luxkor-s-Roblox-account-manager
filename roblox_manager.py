@@ -17,6 +17,7 @@ Uso:  pyw roblox_manager.py      (necesita:  pip install pillow)
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import concurrent.futures
 import copy
@@ -277,6 +278,7 @@ class Store:
     def __init__(self, path: str):
         self.path = path
         self.lock = threading.RLock()
+        self._dirty, self._timer = False, None
         self.data = self._load()
 
     def _load(self):
@@ -310,6 +312,28 @@ class Store:
         if not IS_WINDOWS:
             os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
+        self._dirty = False
+
+    SAVE_DELAY = 1.0  # segundos que se agrupan los cambios poco importantes (último uso, ajustes) en una sola escritura
+
+    def _save_later(self):
+        """Guardado diferido: evita un fsync por cada cambio menor. Quien llama tiene self.lock."""
+        self._dirty = True
+        if self._timer is None:
+            self._timer = threading.Timer(self.SAVE_DELAY, self.flush)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def flush(self):
+        """Escribe ya los cambios pendientes (se llama al cerrar la aplicación)."""
+        with self.lock:
+            self._timer = None
+            if not self._dirty:
+                return
+            try:
+                self._save()
+            except OSError:
+                log.exception("No se pudo guardar data.json")
 
     # -- cuentas
     def accounts(self):
@@ -351,11 +375,11 @@ class Store:
             self._save()
             return True
 
-    def update_account(self, account_id: str, **fields):
-        self.update_accounts({account_id: fields})
+    def update_account(self, account_id: str, *, defer=False, **fields):
+        self.update_accounts({account_id: fields}, defer=defer)
 
-    def update_accounts(self, updates: dict) -> int:
-        """Actualiza varias cuentas con una sola escritura atómica del archivo."""
+    def update_accounts(self, updates: dict, defer=False) -> int:
+        """Actualiza varias cuentas con una sola escritura atómica del archivo (defer=True: agrupada y diferida)."""
         if not updates:
             return 0
         with self.lock:
@@ -366,7 +390,7 @@ class Store:
                     a.update(fields)
                     changed += 1
             if changed:
-                self._save()
+                self._save_later() if defer else self._save()
             return changed
 
     def delete_accounts(self, ids):
@@ -380,10 +404,10 @@ class Store:
         with self.lock:
             return dict(self.data["settings"])
 
-    def update_settings(self, **fields):
+    def update_settings(self, *, defer=False, **fields):
         with self.lock:
             self.data["settings"].update(fields)
-            self._save()
+            self._save_later() if defer else self._save()
 
     def places(self):
         with self.lock:
@@ -401,6 +425,21 @@ class Store:
             if icon:
                 entry["icon"] = icon
             self._save()
+
+    def update_places(self, updates: dict) -> int:
+        """Actualiza varios favoritos con una sola escritura. Solo guarda si algo cambió de verdad."""
+        if not updates:
+            return 0
+        with self.lock:
+            changed = 0
+            for p in self.data["places"]:
+                fields = updates.get(p["place_id"])
+                if fields and any(p.get(k) != v for k, v in fields.items()):
+                    p.update(fields)
+                    changed += 1
+            if changed:
+                self._save()
+            return changed
 
     def delete_place(self, place_id: int):
         with self.lock:
@@ -921,6 +960,16 @@ class RobloxAPI:
                 out[pid] = url
         return out
 
+    def place_universe(self, place_id: int):
+        """Universo al que pertenece un lugar (endpoint público, sin cookie). None si Roblox no lo da."""
+        status, _, body = self._request(
+            "GET", "%s/universes/v1/places/%d/universe" % (self.apis_base, int(place_id)),
+            {"User-Agent": USER_AGENT, "Accept": "application/json"})
+        if status != 200:
+            return None
+        data = self._json(body)
+        return _posint(data.get("universeId", data.get("UniverseId")))
+
     # -- inicio rápido (Quick Log In): se escribe un código en un dispositivo donde ya hay sesión
     def _post_json(self, url, payload):
         headers = {"User-Agent": USER_AGENT, "Accept": "application/json", "Content-Type": "application/json",
@@ -1280,6 +1329,8 @@ class Manager:
         self.login = None
         self.session_id = str(uuid.uuid4())
         self._gcache = {}
+        self._fav_checked = {}  # place_id -> instante de la última comprobación de nombre/icono
+        self._fav_lock = threading.Lock()
         self._stop = threading.Event()
 
     # -- ciclo de vida
@@ -1290,10 +1341,18 @@ class Manager:
             self.multi_active, self.multi_detail = False, ""
         threading.Thread(target=self._ticker, daemon=True).start()
         threading.Thread(target=self.refresh_avatars, daemon=True).start()
+        threading.Thread(target=self._refresh_favorites_quietly, daemon=True).start()
+
+    def _refresh_favorites_quietly(self):
+        try:
+            self.refresh_favorites()
+        except Exception:  # noqa: BLE001
+            log.debug("No se pudieron actualizar los favoritos al arrancar", exc_info=True)
 
     def stop(self):
         self._stop.set()
         self.cancel_login()
+        self.store.flush()
 
     def _ticker(self):
         while not self._stop.is_set():
@@ -1594,6 +1653,76 @@ class Manager:
             return self._decorate_games(found)
         return {"games": self._cached("q:" + q.lower(), load)}
 
+    FAV_TTL = 600        # segundos hasta volver a comprobar un favorito que ya tiene nombre e icono
+    FAV_RETRY = 60       # segundos hasta reintentar uno al que le falta el icono
+
+    def refresh_favorites(self, force=False) -> bool:
+        """Pone al día nombre e icono de los favoritos con lo que Roblox muestra ahora.
+        Antes se quedaban con lo que había el día que se guardaron. Devuelve True si cambió algo."""
+        if not self._fav_lock.acquire(blocking=False):
+            return False  # ya hay una comprobación en curso
+        try:
+            now = time.time()
+            todo = [p for p in self.store.places()
+                    if force or now - self._fav_checked.get(p["place_id"], 0)
+                    > (self.FAV_TTL if p.get("icon") else self.FAV_RETRY)]
+            if not todo:
+                return False
+            for p in todo:
+                self._fav_checked[p["place_id"]] = now
+            failed = 0
+
+            universes = {p["place_id"]: p.get("universe_id") for p in todo}
+            lookup = [p["place_id"] for p in todo if not universes[p["place_id"]]]
+
+            def find_universe(pid):
+                try:
+                    return pid, self.api.place_universe(pid)
+                except RobloxError as err:
+                    log.debug("Sin universo para el lugar %s: %s", pid, err)
+                    return pid, None
+            if lookup:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(lookup), 6)) as pool:
+                    for pid, uid in pool.map(find_universe, lookup):
+                        universes[pid] = uid
+
+            details, icons = {}, {}
+            known = sorted({u for u in universes.values() if u})
+            try:
+                for i in range(0, len(known), 100):
+                    details.update(self.api.game_details(known[i:i + 100]))
+            except RobloxError as err:
+                failed += 1
+                log.info("Sin nombres actuales de favoritos: %s", err)
+            try:
+                ids = [p["place_id"] for p in todo]
+                for i in range(0, len(ids), 100):
+                    icons.update(self.api.place_icons(ids[i:i + 100]))
+            except RobloxError as err:
+                failed += 1
+                log.info("Sin iconos actuales de favoritos: %s", err)
+            if failed == 2:  # sin red: se reintenta pronto en vez de esperar al próximo ciclo
+                for p in todo:
+                    self._fav_checked.pop(p["place_id"], None)
+                return False
+
+            updates = {}
+            for p in todo:
+                pid, fields = p["place_id"], {}
+                uid = universes.get(pid)
+                if uid and uid != p.get("universe_id"):
+                    fields["universe_id"] = uid
+                name = ((details.get(uid) or {}).get("name") or "").strip()[:40]
+                if name:
+                    fields["name"] = name
+                if icons.get(pid):
+                    fields["icon"] = icons[pid]
+                if fields:
+                    updates[pid] = fields
+            return self.store.update_places(updates) > 0
+        finally:
+            self._fav_lock.release()
+
     # -- inicio de sesión: ventana de navegador aislada / código rápido
     def start_login(self, method: str):
         if method not in ("browser", "quick"):
@@ -1747,7 +1876,7 @@ class Manager:
                 raise ValueError("Tema no válido.")
             changes["theme"] = body["theme"]
         if changes:
-            self.store.update_settings(**changes)
+            self.store.update_settings(defer=True, **changes)
 
     def set_multi(self, enabled: bool):
         self.store.update_settings(multi=bool(enabled))
@@ -1851,7 +1980,7 @@ class Manager:
             version_before = self._player_version()
             launch_started = time.monotonic()
             self.plat.launch(build_launch_uri(ticket, place, job))
-            self.store.update_account(aid, last_launch=int(time.time()))
+            self.store.update_account(aid, last_launch=int(time.time()), defer=True)
             pid = self._wait_new_pid(before, 15)
             with self.lock:
                 self._launch_started[aid] = launch_started
@@ -1873,7 +2002,7 @@ class Manager:
 
     def _save_launch_settings(self, settings):
         try:
-            self.store.update_settings(**settings)
+            self.store.update_settings(defer=True, **settings)
         except Exception:  # noqa: BLE001
             log.exception("No se pudieron guardar los ajustes del lanzamiento")
 
@@ -1938,7 +2067,7 @@ class Manager:
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(ids), 8))) as pool:
                 list(pool.map(one, ids))
-            self.store.update_accounts({aid: {"last_launch": stamp} for aid, stamp in launch_dates.items()})
+            self.store.update_accounts({aid: {"last_launch": stamp} for aid, stamp in launch_dates.items()}, defer=True)
             self._assign_pids(launched, before, version_before, launch_times)
         except Exception:  # noqa: BLE001
             log.exception("Fallo inesperado en el lanzamiento a la vez")
@@ -1953,6 +2082,7 @@ class Manager:
             return
         launch_times = launch_times or {}
         found, deadline = {}, time.time() + self.PID_WAIT
+        cmdlines = {}  # pid -> línea de comandos ya leída (no se repite la consulta a Windows en cada vuelta)
         new = []
         update_state = None
         while True:
@@ -1965,7 +2095,11 @@ class Manager:
             for pid in new:
                 if pid in taken:
                     continue
-                cmd = self.plat.cmdline(pid) or ""
+                cmd = cmdlines.get(pid)
+                if not cmd:
+                    cmd = self.plat.cmdline(pid) or ""
+                    if cmd:  # si Windows aún no la deja leer, se reintenta en la próxima vuelta
+                        cmdlines[pid] = cmd
                 for aid, tracker in launched:
                     if aid not in found and tracker in cmd:
                         found[aid] = pid
@@ -2002,7 +2136,7 @@ class Manager:
             new = [p for p in self.plat.list_pids() if p not in before]
             if new:
                 return max(new)
-            time.sleep(0.5)
+            self.cancel.wait(0.15)  # la instantánea de procesos es barata: se sondea más a menudo
         return None
     def close(self, ids, everything=False):
         if everything:
@@ -2048,6 +2182,17 @@ def draw_logo(size: int = 256):
     logo = logo.rotate(-14, resample=Image.BICUBIC, center=(c, c))
     out = Image.alpha_composite(Image.alpha_composite(tile, glow), logo)
     return out.resize((size, size), Image.LANCZOS)
+
+
+def load_logo(size: int = 256):
+    """El logo ya dibujado (assets/logo.png, idéntico pixel a pixel); si no está, se dibuja como siempre."""
+    try:
+        with Image.open(asset_path("logo.png")) as im:
+            if im.size == (size, size):
+                return im.convert("RGBA")
+    except (OSError, ValueError):
+        pass
+    return draw_logo(size)
 
 
 def save_ico(path: str) -> None:
@@ -2134,17 +2279,76 @@ def fit_lines(text: str, font, width: int, lines: int = 2):
     return out or [""]
 
 
-def fetch_image(url: str):
-    if not IMG_OK(url):
-        raise RobloxError("Imagen no permitida.")
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with _OPENER.open(req, timeout=15) as resp:
-        data = resp.read(2_000_000)
+IMAGE_DISK_DIR = None      # main() lo fija a %APPDATA%\RobloxManager\img; None = sin caché en disco (pruebas)
+IMAGE_DISK_LIMIT = 400     # archivos que se conservan en esa carpeta
+
+
+def _disk_image_path(url: str):
+    if not IMAGE_DISK_DIR:
+        return None
+    return os.path.join(IMAGE_DISK_DIR, hashlib.sha256(url.encode("utf-8")).hexdigest()[:40] + ".img")
+
+
+def _decode_image(data: bytes):
     img = Image.open(io.BytesIO(data))
     if img.width * img.height > 4_000_000:  # evita imágenes "bomba" que gastan toda la memoria
         raise RobloxError("Imagen demasiado grande.")
     img.load()
     return img
+
+
+def fetch_image(url: str):
+    """Descarga una imagen de Roblox. Sus URL llevan el hash del contenido, así que la copia en disco nunca caduca:
+    al abrir la app los avatares y los iconos salen al instante en vez de volver a bajarse."""
+    if not IMG_OK(url):
+        raise RobloxError("Imagen no permitida.")
+    path = _disk_image_path(url)
+    if path:
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read(2_000_001)
+            if 0 < len(data) <= 2_000_000:
+                img = _decode_image(data)
+                try:
+                    os.utime(path, None)  # marca de "usada hace poco" para la limpieza
+                except OSError:
+                    pass
+                return img
+        except Exception:  # noqa: BLE001  (archivo ilegible o dañado: es solo una caché)
+            try:
+                os.remove(path)  # copia dañada: se descarga de nuevo
+            except OSError:
+                pass
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with _OPENER.open(req, timeout=15) as resp:
+        data = resp.read(2_000_000)
+    img = _decode_image(data)
+    if path:
+        try:
+            tmp = "%s.%d.tmp" % (path, threading.get_ident())
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, path)
+        except OSError:
+            pass  # la caché en disco es solo un adelanto
+    return img
+
+
+def prune_image_cache(limit: int = IMAGE_DISK_LIMIT) -> None:
+    """Deja como mucho `limit` imágenes en la caché de disco, quitando las menos usadas."""
+    if not IMAGE_DISK_DIR:
+        return
+    try:
+        entries = []
+        for name in os.listdir(IMAGE_DISK_DIR):
+            if name.endswith((".img", ".tmp")):
+                path = os.path.join(IMAGE_DISK_DIR, name)
+                entries.append((os.path.getmtime(path), path))
+        entries.sort()
+        for _stamp, path in entries[:max(0, len(entries) - limit)]:
+            os.remove(path)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------------------
@@ -2520,14 +2724,52 @@ class AccountRow(tk.Canvas):
         self.app, self.a, self.idx, self.sel = app, a, idx, sel
         self.bgc = C["selected"] if sel else C["card"]
         super().__init__(parent, bg=C["panel"], height=px(self.H), highlightthickness=0, bd=0, cursor="hand2")
-        self.b_edit = Btn(self, "✎", lambda: app.rename(a["id"], a["alias"]), "ghost", padx=10, pady=6, font="s", bg=self.bgc)
+        # los botones leen self.a / self.idx: la fila se actualiza en sitio (set_data) sin recrearla
+        self.b_edit = Btn(self, "✎", lambda: app.rename(self.a["id"], self.a["alias"]), "ghost", padx=10, pady=6,
+                          font="s", bg=self.bgc)
         self._bg_outer = _rounded_canvas_items(self, "background", C["line"])
         self._bg_inner = _rounded_canvas_items(self, "background", self.bgc)
         self._job, self._width, self._keep = None, 0, []
         self._rendered = False
+        self._avatar_token = 0
+        self._sig = self._signature(a, sel)
         self.bind("<Configure>", self._on_size)
-        self.bind("<Button-1>", lambda e: app.toggle(a["id"], idx, bool(e.state & 0x1)))
-        self.bind("<Double-Button-1>", lambda e: app.do_launch([a["id"]]))
+        self.bind("<Button-1>", lambda e: app.toggle(self.a["id"], self.idx, bool(e.state & 0x1)))
+        self.bind("<Double-Button-1>", lambda e: app.do_launch([self.a["id"]]))
+
+    @staticmethod
+    def _signature(a, sel):
+        return (a["alias"], a["username"], a["status"], a["tag"], a["pid"], a.get("avatar"), bool(sel))
+
+    def set_data(self, a, idx, sel):
+        """Pone la fila al día con los datos nuevos sin destruirla: solo se repinta lo que cambió."""
+        old, old_sel = self.a, self.sel
+        self.a, self.idx = a, idx
+        sig = self._signature(a, sel)
+        if sig == self._sig:
+            return
+        self._sig, self.sel = sig, bool(sel)
+        self.bgc = C["selected"] if self.sel else C["card"]
+        if self.sel != old_sel:
+            self.b_edit.configure(bg=self.bgc)
+        if not self._rendered:
+            return  # render() ya usará los datos nuevos
+        if self.sel != old_sel:
+            n = px(22)
+            self.itemconfigure(self._check_item, image=photo(("chk", self.sel, n), lambda: check_image(self.sel, n)))
+        if (old.get("avatar"), old["tag"], old["alias"] or old["username"]) != \
+                (a.get("avatar"), a["tag"], a["alias"] or a["username"]):
+            self._load_avatar()
+        self._resize_content()
+
+    def _load_avatar(self):
+        a = self.a
+        self._avatar_token += 1
+        token = self._avatar_token
+        self._keep = self._keep[-1:]  # la imagen que se ve ahora se conserva hasta que llegue la nueva
+        self.app.set_image(a.get("avatar"), "avatar", px(44), a["alias"] or a["username"],
+                           lambda ph, it=self._avatar_item, t=token: self._apply(it, ph, t),
+                           RING.get(a["tag"], RING["idle"]))
 
     def _on_size(self, e):
         if e.width == self._width:
@@ -2541,7 +2783,7 @@ class AccountRow(tk.Canvas):
             self._job = self.after(16, self.render)
 
     def render(self):
-        w, h, a = self._width, px(self.H), self.a
+        w, h = self._width, px(self.H)
         if w < 120:
             return
         self._job = None
@@ -2557,11 +2799,9 @@ class AccountRow(tk.Canvas):
         self._check_item = self.create_image(pad, h // 2,
                                              image=photo(("chk", self.sel, n), lambda: check_image(self.sel, n)),
                                              anchor="w", tags=("content",))
-        size = px(44)
         x = pad + n + px(14)
         self._avatar_item = self.create_image(x, h // 2, anchor="w", tags=("content",))
-        self.app.set_image(a.get("avatar"), "avatar", size, a["alias"] or a["username"],
-                           lambda ph, it=self._avatar_item: self._apply(it, ph), RING.get(a["tag"], RING["idle"]))
+        self._load_avatar()
         self._button_items = [self.create_window(0, h // 2, window=b, anchor="e", tags=("content",))
                               for b in (self.b_edit,)]
         self._alias_item = self.create_text(0, h * 0.36, anchor="w", fill=C["ink"], font=FONTS["b"],
@@ -2604,7 +2844,9 @@ class AccountRow(tk.Canvas):
         self.coords(self._status_item, bx + bw / 2, h * 0.68)
         self.itemconfigure(self._status_item, text=text, fill=fg)
 
-    def _apply(self, item, ph):
+    def _apply(self, item, ph, token=None):
+        if token is not None and token != self._avatar_token:
+            return  # llegó tarde: ya se pidió una imagen más nueva (otro color de anillo)
         self._keep.append(ph)
         try:
             self.itemconfigure(item, image=ph)
@@ -2867,7 +3109,7 @@ class App:
         for key, size, weight in (("n", 10, "normal"), ("b", 10, "bold"), ("s", 9, "normal"), ("sb", 9, "bold"),
                                   ("h", 17, "bold"), ("t", 13, "bold")):
             FONTS[key] = tkfont.Font(root=root, family="Segoe UI", size=size, weight=weight)
-        self._logo_source = draw_logo(256)
+        self._logo_source = load_logo(256)
         self.icons = [ImageTk.PhotoImage(self._logo_source if n == 256 else
                                          self._logo_source.resize((n, n), Image.Resampling.LANCZOS))
                       for n in (256, 64, 32)]
@@ -2875,13 +3117,15 @@ class App:
         self.q = queue.Queue()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=6)
         self.photos, self._pending_photos = OrderedDict(), {}
+        self.raw_images, self._raw_lock = OrderedDict(), threading.Lock()  # url -> imagen ya descargada
         self.sel, self.anchor = set(), None
         self.star_photos = {}
         root.report_callback_exception = self._report_callback_exception
         self.state, self.acc_sig, self.places_sig = None, None, None
+        self.acc_rows, self.acc_order = {}, []   # id -> AccountRow, y el orden en que están puestas
         self.greq, self.sorts, self.cat_id, self.sorts_error = 0, [], None, ""
         self.game_cards, self.sel_game, self.add_dialog = [], None, None
-        self._fav_icon_loading = False
+        self._fav_refreshing = False
         self.toast_job = self.save_job = self.search_job = self.layout_job = None
         self._suppress_search = False
         self.fav_confirm = None
@@ -3140,6 +3384,22 @@ class App:
         while len(self.photos) > IMAGE_CACHE_LIMIT:
             self.photos.popitem(last=False)
 
+    RAW_IMAGE_LIMIT = 64
+
+    def _raw_image(self, url):
+        """Imagen original por URL. Cambiar solo el anillo de color (estado de la cuenta) no vuelve a descargarla."""
+        with self._raw_lock:
+            img = self.raw_images.get(url)
+            if img is not None:
+                self.raw_images.move_to_end(url)
+                return img
+        img = fetch_image(url).convert("RGBA")
+        with self._raw_lock:
+            self.raw_images[url] = img
+            while len(self.raw_images) > self.RAW_IMAGE_LIMIT:
+                self.raw_images.popitem(last=False)
+        return img
+
     def set_image(self, url, kind, size, letter, apply, ring=None):
         circle = kind == "avatar"
         key = (url, kind, size, ring)
@@ -3179,7 +3439,7 @@ class App:
 
         def run():
             try:
-                res, err = shape_image(fetch_image(url), size, circle, ring), None
+                res, err = shape_image(self._raw_image(url), size, circle, ring), None
             except Exception as exc:  # noqa: BLE001
                 res, err = None, exc
             self.q.put((done, res, err))
@@ -3316,12 +3576,12 @@ class App:
             self.notice.grid_remove()
         self.acc_count.configure(text="%d" % len(st["accounts"]) if st["accounts"] else "")
         sig = (tuple((a["id"], a["alias"], a["username"], a["status"], a["tag"], a["pid"], a.get("avatar"),
-                      when(a["last_launch"]), a["id"] in self.sel) for a in st["accounts"]), st["launching"])
+                      a["id"] in self.sel) for a in st["accounts"]), st["launching"])
         if sig != self.acc_sig:
             self.acc_sig = sig
             self.render_accounts()
         self.update_footer()
-        psig = tuple((p["place_id"], p["name"]) for p in st["places"])
+        psig = tuple((p["place_id"], p["name"], p.get("icon")) for p in st["places"])
         if psig != self.places_sig:
             self.places_sig = psig
             if self.cat_id == "fav":
@@ -3336,12 +3596,31 @@ class App:
 
     # -- cuentas
     def render_accounts(self):
-        st = self.state
+        """Si solo cambió el contenido de las filas (selección, estado, avatar…), se actualizan en sitio.
+        Solo cuando se añade, quita o reordena una cuenta se reconstruye la lista entera."""
+        accounts = self.state["accounts"]
+        ids = [a["id"] for a in accounts]
+        if accounts and ids == self.acc_order:
+            try:
+                for idx, a in enumerate(accounts):
+                    self.acc_rows[a["id"]].set_data(a, idx, a["id"] in self.sel)
+            except Exception:  # noqa: BLE001
+                log.exception("No se pudieron actualizar las filas; se reconstruye la lista")
+            else:
+                self._accounts_footer(accounts)
+                return
+        self._rebuild_accounts(accounts, ids)
+
+    def _accounts_footer(self, accounts):
+        self.btn_selall.set_text("Ninguna" if accounts and len(self.sel) == len(accounts) else "Todas")
+        self.btn_verify.set_enabled(bool(accounts))
+
+    def _rebuild_accounts(self, accounts, ids):
         sf = self.acc_sf
         y = sf.canvas.yview()[0]
         for child in sf.inner.winfo_children():
             child.destroy()
-        accounts = st["accounts"]
+        self.acc_rows = {}
         if not accounts:
             box = tk.Frame(sf.inner, bg=C["panel"])
             box.pack(fill="x", pady=px(48))
@@ -3350,9 +3629,11 @@ class App:
                 bg=C["panel"], justify="center").pack(pady=(px(8), px(16)))
             Btn(box, "+ Añadir cuenta", self.open_add, "primary", padx=20, pady=9, font="b").pack()
         for idx, a in enumerate(accounts):
-            AccountRow(self, sf.inner, a, idx, a["id"] in self.sel).pack(fill="x", pady=(0, px(8)), padx=(0, px(2)))
-        self.btn_selall.set_text("Ninguna" if accounts and len(self.sel) == len(accounts) else "Todas")
-        self.btn_verify.set_enabled(bool(accounts))
+            row = AccountRow(self, sf.inner, a, idx, a["id"] in self.sel)
+            row.pack(fill="x", pady=(0, px(8)), padx=(0, px(2)))
+            self.acc_rows[a["id"]] = row
+        self.acc_order = ids
+        self._accounts_footer(accounts)
         sf.inner.update_idletasks()
         sf.canvas.yview_moveto(y)
 
@@ -3596,27 +3877,18 @@ class App:
         games = [{"universe_id": p.get("universe_id"), "place_id": p["place_id"], "name": p["name"],
                   "players": None, "icon": p.get("icon")} for p in places]
         self.render_games(games, fav=True)
-        missing = [p for p in places if not p.get("icon")]
-        if missing and not self._fav_icon_loading:
-            self._fav_icon_loading = True
-            self.bg(lambda: self.m.api.place_icons([p["place_id"] for p in missing]),
-                    lambda r, e: self._favorite_icons_done(missing, r, e))
+        if places and not self._fav_refreshing:  # nombre e icono actuales; el TTL evita repetir la consulta
+            self._fav_refreshing = True
+            self.bg(self.m.refresh_favorites, self._favorites_refreshed)
         msg = "" if games else "Aún no tienes favoritos. Elige un juego y pulsa «★ Favorito»."
         if self.sorts_error and not self.sorts:
             msg = self.sorts_error + " Reintentando… mientras tanto puedes buscar un juego."
         self.set_gmsg(msg, bool(self.sorts_error and not self.sorts))
 
-    def _favorite_icons_done(self, places, icons, err):
-        self._fav_icon_loading = False
-        if err or not icons:
-            return
-        current_ids = {place["place_id"] for place in self.m.store.places()}
-        for place in places:
-            icon = icons.get(place["place_id"])
-            if icon and place["place_id"] in current_ids:
-                self.m.store.add_place(place["name"], place["place_id"], place.get("universe_id"), icon)
-        if self.cat_id == "fav" and not self.search_var.get().strip():
-            self.show_favs()
+    def _favorites_refreshed(self, changed, err):
+        self._fav_refreshing = False
+        if not err and changed:
+            self.refresh()  # apply_state detecta el cambio de nombre/icono y repinta los favoritos
 
     def clear_cards(self):
         for card in self.game_cards:
@@ -3816,13 +4088,21 @@ def main(argv=None) -> int:
         os.environ["ROBLOX_MANAGER_HOME"] = args.data_dir
 
     directory = data_dir()
+    global IMAGE_DISK_DIR
+    IMAGE_DISK_DIR = os.path.join(directory, "img")
+    try:
+        os.makedirs(IMAGE_DISK_DIR, exist_ok=True)
+    except OSError:
+        IMAGE_DISK_DIR = None
     setup_logging(directory)
     prepare_windows()
     if not single_instance():
         return 0
     manager = Manager(Store(os.path.join(directory, "data.json")), RobloxAPI(), make_platform())
+    atexit.register(manager.store.flush)  # por si la app se cierra sin pasar por manager.stop()
     manager.start()
     threading.Thread(target=sweep_login_profiles, daemon=True).start()
+    threading.Thread(target=prune_image_cache, daemon=True).start()
     try:
         App(manager).run()
     except Exception:  # noqa: BLE001
